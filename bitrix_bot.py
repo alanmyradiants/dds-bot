@@ -13,8 +13,12 @@ app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
-# ЖЕСТКО ставим правильный входящий webhook
-BITRIX_WEBHOOK_URL = "https://joto.bitrix24.ru/rest/1/mbchdjedw9nruj8l"
+# ВАЖНО:
+# После нажатия "Перегенерировать" в Bitrix вставь сюда НОВЫЙ webhook.
+BITRIX_WEBHOOK_URL = os.getenv(
+    "BITRIX_WEBHOOK_URL",
+    "https://joto.bitrix24.ru/rest/1/mbchdjedw9nruj8l"
+).rstrip("/")
 
 DDS_CATEGORIES = [
     "Поступления от покупателей",
