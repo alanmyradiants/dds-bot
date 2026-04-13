@@ -12,9 +12,13 @@ import anthropic
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
-BITRIX_WEBHOOK_URL = os.getenv("BITRIX_WEBHOOK_URL", "https://joto.bitrix24.ru/rest/1/ge7hgsje88e51nuw").rstrip("/")
-BOT_CLIENT_ID = os.getenv("BOT_CLIENT_ID", "glhjxdm0jwb216zd3kdau2mwtf4z0fbu")
+ANTHROPIC_API_KEY      = os.getenv("ANTHROPIC_API_KEY", "").strip()
+# Вебхук с imbot-скоупом — для отправки сообщений
+BITRIX_WEBHOOK_URL     = os.getenv("BITRIX_WEBHOOK_URL", "https://joto.bitrix24.ru/rest/1/ge7hgsje88e51nuw").rstrip("/")
+# Отдельный вебхук только с disk-скоупом — для скачивания файлов
+# Создайте новый входящий вебхук в Bitrix24 с правом "Диск (disk)" и вставьте URL сюда
+BITRIX_DISK_WEBHOOK_URL = os.getenv("BITRIX_DISK_WEBHOOK_URL", BITRIX_WEBHOOK_URL).rstrip("/")
+BOT_CLIENT_ID          = os.getenv("BOT_CLIENT_ID", "glhjxdm0jwb216zd3kdau2mwtf4z0fbu")
 
 DDS_CATEGORIES = [
     "Поступления от покупателей",
@@ -55,10 +59,8 @@ def parse_request_data():
             return request.get_json(force=True) or {}
     except Exception:
         pass
-
     if request.form:
         return request.form.to_dict()
-
     raw = request.get_data(as_text=True)
     if raw:
         try:
@@ -70,7 +72,6 @@ def parse_request_data():
             return {k: v[0] for k, v in parsed.items()}
         except Exception:
             pass
-
     return {}
 
 
@@ -83,14 +84,6 @@ def bitrix_post(method_name, payload, timeout=20):
     response = requests.post(url, json=payload, timeout=timeout)
     print(f"{method_name} POST status={response.status_code}")
     print(f"{method_name} POST response={safe_preview(response.text, 3000)}")
-    return response
-
-
-def bitrix_get(method_name, params=None, timeout=20):
-    url = f"{BITRIX_WEBHOOK_URL}/{method_name}.json"
-    response = requests.get(url, params=params or {}, timeout=timeout)
-    print(f"{method_name} GET status={response.status_code}")
-    print(f"{method_name} GET response={safe_preview(response.text, 4000)}")
     return response
 
 
@@ -116,11 +109,7 @@ def send_file(dialog_id, filename, content_bytes):
         encoded = base64.b64encode(content_bytes).decode()
         resp = bitrix_post(
             "im.disk.file.commit",
-            {
-                "DIALOG_ID": dialog_id,
-                "FILE_NAME": filename,
-                "FILE_CONTENT": encoded,
-            },
+            {"DIALOG_ID": dialog_id, "FILE_NAME": filename, "FILE_CONTENT": encoded},
             timeout=60,
         )
         if resp.status_code != 200:
@@ -130,11 +119,7 @@ def send_file(dialog_id, filename, content_bytes):
             raise ValueError(result.get("error_description") or result.get("error"))
     except Exception as e:
         print(f"send_file error: {e}")
-        send_message(
-            dialog_id,
-            f"⚠️ Не удалось отправить файл автоматически ({e}).\n"
-            "Обратитесь к администратору.",
-        )
+        send_message(dialog_id, f"⚠️ Не удалось отправить файл: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -143,14 +128,10 @@ def send_file(dialog_id, filename, content_bytes):
 
 def find_pdf_in_payload(data):
     result = {
-        "file_id": None,
-        "chat_id": None,
-        "url_download": None,
-        "url_show": None,
-        "unified_link": None,
-        "filename": None,
+        "file_id": None, "chat_id": None,
+        "url_download": None, "url_show": None,
+        "unified_link": None, "filename": None,
     }
-
     for key, val in data.items():
         key_upper = key.upper()
         if "FILES" in key_upper and key_upper.endswith("][NAME]") and val:
@@ -160,8 +141,7 @@ def find_pdf_in_payload(data):
 
                 def get_field(*suffixes):
                     for suffix in suffixes:
-                        for candidate in [base + suffix, base + suffix.lower(),
-                                          base + suffix.upper()]:
+                        for candidate in [base + suffix, base + suffix.lower(), base + suffix.upper()]:
                             if candidate in data:
                                 return data[candidate]
                     return None
@@ -171,26 +151,22 @@ def find_pdf_in_payload(data):
                 result["chat_id"] = get_field("][CHATID]", "][chatId]")
                 result["url_download"] = get_field("][URLDOWNLOAD]", "][urlDownload]")
                 result["url_show"] = get_field("][URLSHOW]", "][urlShow]")
-                result["unified_link"] = get_field(
-                    "][VIEWERATTRS][UNIFIEDLINK]",
-                    "][viewerAttrs][unifiedLink]",
-                )
+                result["unified_link"] = get_field("][VIEWERATTRS][UNIFIEDLINK]", "][viewerAttrs][unifiedLink]")
                 return result
 
-    # Запасной вариант
-    file_id = (
-        data.get("data[PARAMS][FILE_ID][0]")
-        or data.get("data[PARAMS][PARAMS][FILE_ID][0]")
-    )
+    file_id = data.get("data[PARAMS][FILE_ID][0]") or data.get("data[PARAMS][PARAMS][FILE_ID][0]")
     if file_id:
         result["file_id"] = file_id
         result["filename"] = "document.pdf"
-
     return result
 
 
 def get_disk_file_info(file_id):
-    response = bitrix_get("disk.file.get", params={"id": file_id}, timeout=20)
+    """Используем отдельный disk-вебхук без imbot-скоупа."""
+    url = f"{BITRIX_DISK_WEBHOOK_URL}/disk.file.get.json"
+    response = requests.get(url, params={"id": file_id}, timeout=20)
+    print(f"disk.file.get GET status={response.status_code}")
+    print(f"disk.file.get GET response={safe_preview(response.text, 4000)}")
     if response.status_code != 200:
         raise ValueError(f"disk.file.get вернул HTTP {response.status_code}")
     payload = response.json()
@@ -203,18 +179,14 @@ def get_disk_file_info(file_id):
 
 
 def extract_download_url_from_disk_info(file_info):
-    possible_keys = [
-        "DOWNLOAD_URL", "downloadUrl", "DOWNLOAD_URL_MACHINE",
-        "URL_DOWNLOAD", "urlDownload",
-    ]
-    for key in possible_keys:
+    for key in ["DOWNLOAD_URL", "downloadUrl", "DOWNLOAD_URL_MACHINE", "URL_DOWNLOAD", "urlDownload"]:
         value = file_info.get(key)
         if value:
             return value
     for outer_val in file_info.values():
         if isinstance(outer_val, dict):
-            for inner_key in possible_keys:
-                value = outer_val.get(inner_key)
+            for key in ["DOWNLOAD_URL", "downloadUrl"]:
+                value = outer_val.get(key)
                 if value:
                     return value
     return None
@@ -222,45 +194,28 @@ def extract_download_url_from_disk_info(file_info):
 
 def download_pdf(url):
     session = requests.Session()
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/pdf,application/octet-stream,*/*",
-    }
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/pdf,application/octet-stream,*/*"}
     response = session.get(url, headers=headers, timeout=60, allow_redirects=True)
     content_type = (response.headers.get("Content-Type") or "").lower()
-
     print(f"download_pdf status={response.status_code}")
     print(f"download_pdf content_type={content_type}")
     print(f"download_pdf first_bytes={response.content[:20]}")
-
     if response.status_code != 200:
-        raise ValueError(f"Ошибка скачивания PDF: HTTP {response.status_code}")
-
+        raise ValueError(f"Ошибка скачивания: HTTP {response.status_code}")
     if "application/pdf" in content_type or response.content.startswith(b"%PDF"):
         return response.content
-
-    preview = ""
-    try:
-        preview = response.text[:500].replace("\n", " ")
-    except Exception:
-        preview = str(response.content[:200])
-
+    preview = response.text[:300].replace("\n", " ") if response.text else str(response.content[:200])
     raise ValueError(f"Получили не PDF, а {content_type}: {preview}")
 
 
 def get_pdf_bytes(file_id, fallback_url=None):
-    # Вариант 1: прямое скачивание через REST endpoint (с токеном вебхука)
+    # Вариант 1: disk.file.download через disk-вебхук
     try:
-        url = f"{BITRIX_WEBHOOK_URL}/disk.file.download/"
-        print(f"Trying REST download: {url}?id={file_id}")
-        session = requests.Session()
-        resp = session.get(
-            url,
-            params={"id": file_id},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=60,
-            allow_redirects=True,
-        )
+        url = f"{BITRIX_DISK_WEBHOOK_URL}/disk.file.download/"
+        print(f"Trying REST download via disk webhook: {url}?id={file_id}")
+        resp = requests.get(url, params={"id": file_id},
+                            headers={"User-Agent": "Mozilla/5.0"},
+                            timeout=60, allow_redirects=True)
         content_type = (resp.headers.get("Content-Type") or "").lower()
         print(f"REST download status={resp.status_code} content_type={content_type}")
         print(f"REST download first_bytes={resp.content[:20]}")
@@ -268,11 +223,11 @@ def get_pdf_bytes(file_id, fallback_url=None):
             "application/pdf" in content_type or resp.content.startswith(b"%PDF")
         ):
             return resp.content
-        print(f"REST download failed or not PDF, trying disk.file.get...")
+        print("REST download did not return PDF, trying disk.file.get...")
     except Exception as e:
         print(f"REST download exception: {e}")
 
-    # Вариант 2: disk.file.get → DOWNLOAD_URL с токеном
+    # Вариант 2: disk.file.get → токенизированный DOWNLOAD_URL
     try:
         disk_info = get_disk_file_info(file_id)
         print("===== DISK FILE INFO =====")
@@ -284,7 +239,11 @@ def get_pdf_bytes(file_id, fallback_url=None):
     except Exception as e:
         print(f"disk.file.get failed: {e}")
 
-    raise ValueError("Не удалось скачать PDF — проверьте права вебхука (disk + imbot)")
+    raise ValueError(
+        "Не удалось скачать PDF. "
+        "Создайте новый вебхук Bitrix24 только с правом 'Диск (disk)' "
+        "и добавьте его URL в Railway как BITRIX_DISK_WEBHOOK_URL"
+    )
 
 
 # ─────────────────────────────────────────────
@@ -296,7 +255,6 @@ def extract_transactions(pdf_bytes):
         raise ValueError("Не указан ANTHROPIC_API_KEY")
 
     pdf_b64 = base64.b64encode(pdf_bytes).decode()
-
     system_prompt = (
         "Из банковской выписки извлеки транзакции и распредели по статьям ДДС.\n"
         f"Статьи: {', '.join(DDS_CATEGORIES)}\n"
@@ -310,22 +268,13 @@ def extract_transactions(pdf_bytes):
         model="claude-opus-4-6",
         max_tokens=8000,
         system=system_prompt,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "document",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "application/pdf",
-                            "data": pdf_b64,
-                        },
-                    },
-                    {"type": "text", "text": "Извлеки все транзакции."},
-                ],
-            }
-        ],
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64}},
+                {"type": "text", "text": "Извлеки все транзакции."},
+            ],
+        }],
     )
 
     text = msg.content[0].text
@@ -333,41 +282,28 @@ def extract_transactions(pdf_bytes):
 
     start = text.find("[")
     end = text.rfind("]")
-
     if start == -1 or end == -1 or end < start:
         raise ValueError("Транзакции не найдены в ответе ИИ")
 
     json_str = text[start:end + 1]
-
     try:
         return json.loads(json_str)
     except json.JSONDecodeError:
-        # Восстанавливаем обрезанный JSON
         last_close = json_str.rfind("}")
         if last_close == -1:
             raise ValueError("Не удалось распарсить ответ ИИ")
-        salvaged = json_str[:last_close + 1] + "]"
-        return json.loads(salvaged)
+        return json.loads(json_str[:last_close + 1] + "]")
 
 
 def to_csv(transactions):
     out = io.StringIO()
     writer = csv.writer(out, delimiter=";", quoting=csv.QUOTE_ALL)
     writer.writerow(["Дата", "Контрагент", "Описание", "Приход", "Расход", "Статья ДДС"])
-
     for t in transactions:
         amount = float(t.get("amount", 0) or 0)
         inc = f"{amount:.2f}" if t.get("type") == "in" else ""
         exp = f"{amount:.2f}" if t.get("type") == "out" else ""
-        writer.writerow([
-            t.get("date", ""),
-            t.get("counterparty", ""),
-            t.get("description", ""),
-            inc,
-            exp,
-            t.get("category", ""),
-        ])
-
+        writer.writerow([t.get("date",""), t.get("counterparty",""), t.get("description",""), inc, exp, t.get("category","")])
     return ("\ufeff" + out.getvalue()).encode("utf-8")
 
 
@@ -378,22 +314,11 @@ def to_csv(transactions):
 def process_pdf_async(dialog_id, file_id, fallback_url):
     try:
         pdf_bytes = get_pdf_bytes(file_id, fallback_url=fallback_url)
-
         send_message(dialog_id, "🔍 Анализирую выписку через ИИ...")
-
         transactions = extract_transactions(pdf_bytes)
-
-        total_in = sum(
-            float(t.get("amount", 0) or 0)
-            for t in transactions if t.get("type") == "in"
-        )
-        total_out = sum(
-            float(t.get("amount", 0) or 0)
-            for t in transactions if t.get("type") == "out"
-        )
-
+        total_in  = sum(float(t.get("amount", 0) or 0) for t in transactions if t.get("type") == "in")
+        total_out = sum(float(t.get("amount", 0) or 0) for t in transactions if t.get("type") == "out")
         csv_bytes = to_csv(transactions)
-
         send_message(
             dialog_id,
             f"✅ Готово! Найдено {len(transactions)} транзакций.\n"
@@ -401,10 +326,9 @@ def process_pdf_async(dialog_id, file_id, fallback_url):
             f"📉 Списания: {total_out:,.2f} ₽",
         )
         send_file(dialog_id, "ДДС_выписка.csv", csv_bytes)
-
     except Exception as e:
         print(f"process_pdf_async ERROR: {e}")
-        send_message(dialog_id, f"❌ Ошибка обработки: {str(e)}")
+        send_message(dialog_id, f"❌ Ошибка: {str(e)}")
 
 
 # ─────────────────────────────────────────────
@@ -419,7 +343,8 @@ def bot_handler():
     data = parse_request_data()
 
     print("===== WEBHOOK IN USE =====")
-    print(BITRIX_WEBHOOK_URL)
+    print(f"BOT: {BITRIX_WEBHOOK_URL}")
+    print(f"DISK: {BITRIX_DISK_WEBHOOK_URL}")
     print("===== INCOMING REQUEST =====")
     print(safe_preview(data, 10000))
 
@@ -433,7 +358,6 @@ def bot_handler():
         data.get("data[PARAMS][DIALOG_ID]")
         or data.get("data[PARAMS][TO_CHAT_ID]")
     )
-
     message_text = str(data.get("data[PARAMS][MESSAGE]", "")).strip().lower()
 
     file_info = find_pdf_in_payload(data)
@@ -446,25 +370,20 @@ def bot_handler():
 
     if filename.lower().endswith(".pdf") and file_id:
         send_message(dialog_id, "📄 Получил PDF, начинаю обработку...")
-
-        # Запускаем в фоне — Bitrix получает 200 немедленно
         thread = threading.Thread(
             target=process_pdf_async,
             args=(dialog_id, file_id, fallback_url),
             daemon=True,
         )
         thread.start()
-
     elif message_text in ("привет", "start", "/start", "помощь", "help", ""):
         send_message(
             dialog_id,
-            "👋 Привет! Пришли PDF-выписку из банка — я разнесу транзакции "
-            "по статьям ДДС и верну CSV-файл.",
+            "👋 Привет! Пришли PDF-выписку из банка — я разнесу транзакции по статьям ДДС и верну CSV-файл.",
         )
     else:
         send_message(dialog_id, "Пришли PDF-выписку из банка.")
 
-    # Отвечаем Bitrix сразу, не дожидаясь обработки
     return jsonify({"result": "ok"})
 
 
@@ -475,6 +394,7 @@ def health():
 
 if __name__ == "__main__":
     print("===== STARTING APP =====")
-    print("BITRIX_WEBHOOK_URL =", BITRIX_WEBHOOK_URL)
+    print(f"BOT WEBHOOK: {BITRIX_WEBHOOK_URL}")
+    print(f"DISK WEBHOOK: {BITRIX_DISK_WEBHOOK_URL}")
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
