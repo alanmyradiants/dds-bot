@@ -85,34 +85,11 @@ def send_file(dialog_id, filename, content_bytes):
 
 
 def get_file_url_by_id(file_id):
-    """Получаем ссылку на файл — строим URL напрямую"""
-    # Извлекаем домен и токен из BITRIX_WEBHOOK_URL
-    # URL вида: https://joto.bitrix24.ru/rest/1/TOKEN/
+    """Строим URL напрямую через show_file.php"""
     parts = BITRIX_WEBHOOK_URL.rstrip("/").split("/")
     token = parts[-1]
-    domain = "/".join(parts[:3])  # https://joto.bitrix24.ru
-
-    # Пробуем разные варианты URL для скачивания файла из IM
-    urls_to_try = [
-        f"{domain}/bitrix/components/bitrix/im.messenger/show_file.php?fileId={file_id}&auth={token}",
-        f"{domain}/rest/1/{token}/im.disk.file.get.json?FILE_ID={file_id}",
-        f"{domain}/download.php?id={file_id}&auth={token}",
-    ]
-
-    for url in urls_to_try:
-        try:
-            r = requests.get(url, timeout=10, allow_redirects=True)
-            content_type = r.headers.get("content-type", "")
-            print(f"Trying URL: {url[:80]} -> status={r.status_code} ct={content_type[:50]}")
-            if r.status_code == 200 and "application/pdf" in content_type:
-                return url
-            if r.status_code == 200 and len(r.content) > 1000 and b"%PDF" in r.content[:10]:
-                return url
-        except Exception as e:
-            print(f"URL try error: {e}")
-
-    # Возвращаем первый вариант на попытку
-    return urls_to_try[0]
+    domain = "/".join(parts[:3])
+    return f"{domain}/bitrix/components/bitrix/im.messenger/download.file.php?fileId={file_id}&auth={token}"
 
 
 def download_file(url):
@@ -205,8 +182,20 @@ def bot_handler():
     print(f"ALL FILE KEYS: {file_keys}")
 
     pdf_file_id = None
+    pdf_url_direct = None
 
-    # Вариант 1: data[PARAMS][FILE_ID][0]
+    # Битрикс присылает urlDownload прямо в данных
+    for key, val in data.items():
+        if "FILES" in key and key.endswith("][urlDownload]") and val:
+            # Проверяем что это PDF
+            name_key = key.replace("][urlDownload]", "][name]")
+            fname = data.get(name_key, ".pdf")
+            if fname.lower().endswith(".pdf"):
+                pdf_url_direct = val
+                break
+
+    # Если urlDownload не нашли — берём FILE_ID
+    if not pdf_url_direct:
     file_id_key = data.get("data[PARAMS][FILE_ID][0]")
     if file_id_key:
         pdf_file_id = file_id_key
@@ -218,9 +207,19 @@ def bot_handler():
                 pdf_file_id = val
                 break
 
-    # Получаем URL файла через Битрикс API
+    # Получаем URL файла
     pdf_url = None
-    if pdf_file_id:
+    if pdf_url_direct:
+        parts = BITRIX_WEBHOOK_URL.rstrip("/").split("/")
+        token = parts[-1]
+        domain = "/".join(parts[:3])
+        # Если URL относительный — добавляем домен
+        if pdf_url_direct.startswith("/"):
+            pdf_url = domain + pdf_url_direct + f"&auth={token}"
+        else:
+            pdf_url = pdf_url_direct + f"&auth={token}"
+        print(f"DIRECT URL: {pdf_url[:100]}")
+    elif pdf_file_id:
         pdf_url = get_file_url_by_id(pdf_file_id)
         print(f"FILE_ID: {pdf_file_id}, URL: {pdf_url}")
 
