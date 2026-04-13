@@ -13,13 +13,8 @@ app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
-# ВАЖНО:
-# Здесь должен стоять именно ВХОДЯЩИЙ webhook для REST API,
-# а не webhook "Передавать боту сообщения из чата".
-BITRIX_WEBHOOK_URL = os.getenv(
-    "BITRIX_WEBHOOK_URL",
-    "https://joto.bitrix24.ru/rest/1/mbchdjedw9nruj8l"
-).rstrip("/")
+# ЖЕСТКО ставим правильный входящий webhook
+BITRIX_WEBHOOK_URL = "https://joto.bitrix24.ru/rest/1/mbchdjedw9nruj8l"
 
 DDS_CATEGORIES = [
     "Поступления от покупателей",
@@ -43,7 +38,6 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
 def parse_request_data():
-    """Парсим входящий запрос в любом формате."""
     try:
         if request.is_json:
             return request.get_json(force=True) or {}
@@ -132,9 +126,6 @@ def send_file(dialog_id, filename, content_bytes):
 
 
 def find_pdf_in_payload(data):
-    """
-    Ищем PDF в payload от Bitrix.
-    """
     result = {
         "file_id": None,
         "chat_id": None,
@@ -165,17 +156,15 @@ def find_pdf_in_payload(data):
 
 
 def get_disk_file_info(file_id):
-    """
-    Получаем метаданные файла через Disk API.
-    """
     try:
         r = bitrix_get("disk.file.get", params={"id": file_id}, timeout=20)
+
         if r.status_code != 200:
             raise ValueError(f"disk.file.get returned HTTP {r.status_code}")
 
         payload = r.json()
         if "error" in payload:
-            raise ValueError(f"disk.file.get error: {payload.get('error_description') or payload.get('error')}")
+            raise ValueError(payload.get("error_description") or payload.get("error"))
 
         result = payload.get("result", {})
         if not result:
@@ -188,9 +177,6 @@ def get_disk_file_info(file_id):
 
 
 def extract_download_url_from_disk_info(file_info):
-    """
-    Пытаемся достать ссылку на скачивание из ответа disk.file.get.
-    """
     possible_keys = [
         "DOWNLOAD_URL",
         "downloadUrl",
@@ -204,8 +190,7 @@ def extract_download_url_from_disk_info(file_info):
         if value:
             return value
 
-    # Иногда ссылка может лежать глубже
-    for outer_key, outer_val in file_info.items():
+    for _, outer_val in file_info.items():
         if isinstance(outer_val, dict):
             for inner_key in possible_keys:
                 value = outer_val.get(inner_key)
@@ -216,9 +201,6 @@ def extract_download_url_from_disk_info(file_info):
 
 
 def download_pdf(url):
-    """
-    Скачиваем файл и убеждаемся, что это PDF.
-    """
     session = requests.Session()
     headers = {
         "User-Agent": "Mozilla/5.0",
@@ -253,9 +235,6 @@ def download_pdf(url):
 
 
 def extract_transactions(pdf_bytes):
-    """
-    Отправляем PDF в Claude и просим вернуть JSON массив транзакций.
-    """
     pdf_b64 = base64.b64encode(pdf_bytes).decode()
 
     system_prompt = f"""Из банковской выписки извлеки транзакции и распредели по статьям ДДС.
@@ -328,6 +307,9 @@ def bot_handler():
 
     data = parse_request_data()
 
+    print("===== WEBHOOK IN USE =====")
+    print(BITRIX_WEBHOOK_URL)
+
     print("===== INCOMING REQUEST =====")
     print(safe_preview(data, 10000))
 
@@ -363,39 +345,31 @@ def bot_handler():
     file_id = file_info.get("file_id")
     filename = file_info.get("filename") or "document.pdf"
 
-    # Если пришел PDF — обрабатываем
     if filename.lower().endswith(".pdf") and file_id:
         send_message(dialog_id, "📄 Получил PDF, начинаю обработку...")
 
         try:
-            # 1. Получаем метаданные файла через Disk API
             disk_info = get_disk_file_info(file_id)
             print("===== DISK FILE INFO =====")
             print(safe_preview(disk_info, 5000))
 
-            # 2. Достаем ссылку на скачивание
             download_url = extract_download_url_from_disk_info(disk_info)
             if not download_url:
                 raise ValueError("В ответе disk.file.get не найдена ссылка DOWNLOAD_URL")
 
             print(f"DOWNLOAD URL: {safe_preview(download_url, 1000)}")
 
-            # 3. Скачиваем PDF
             pdf_bytes = download_pdf(download_url)
 
-            # 4. Отправляем в Claude
             send_message(dialog_id, "🔍 Анализирую выписку через ИИ...")
 
             transactions = extract_transactions(pdf_bytes)
 
-            # 5. Считаем итоги
             total_in = sum(float(t.get("amount", 0) or 0) for t in transactions if t.get("type") == "in")
             total_out = sum(float(t.get("amount", 0) or 0) for t in transactions if t.get("type") == "out")
 
-            # 6. Делаем CSV
             csv_bytes = to_csv(transactions)
 
-            # 7. Отправляем результат
             send_message(
                 dialog_id,
                 f"✅ Готово! Найдено {len(transactions)} транзакций.\n"
@@ -425,5 +399,8 @@ def health():
 
 
 if __name__ == "__main__":
+    print("===== STARTING APP =====")
+    print("BITRIX_WEBHOOK_URL =", BITRIX_WEBHOOK_URL)
+
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
