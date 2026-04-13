@@ -17,7 +17,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 # После нажатия "Перегенерировать" в Bitrix вставь сюда НОВЫЙ webhook.
 BITRIX_WEBHOOK_URL = os.getenv(
     "BITRIX_WEBHOOK_URL",
-    "https://joto.bitrix24.ru/rest/1/mbchdjedw9nruj8l"
+    "https://joto.bitrix24.ru/rest/1/ge7hgsje88e51nuw"
 ).rstrip("/")
 
 DDS_CATEGORIES = [
