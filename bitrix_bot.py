@@ -7,7 +7,7 @@ import threading
 import requests
 from urllib.parse import parse_qs
 from flask import Flask, request, jsonify
-import anthropic
+import anthropichttps://github.com/alanmyradiants/dds-bot/blob/main/bitrix_bot.py
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
