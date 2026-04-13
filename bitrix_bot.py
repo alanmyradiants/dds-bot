@@ -84,13 +84,22 @@ def send_file(dialog_id, filename, content_bytes):
         print(f"send_file error: {e}")
 
 
+def get_file_url_by_id(file_id):
+    """Получаем ссылку на файл через Битрикс API"""
+    try:
+        r = requests.get(
+            f"{BITRIX_WEBHOOK_URL}/disk.file.get.json",
+            params={"id": file_id},
+            timeout=10
+        )
+        result = r.json().get("result", {})
+        return result.get("DOWNLOAD_URL") or result.get("DETAIL_URL")
+    except Exception as e:
+        print(f"get_file_url error: {e}")
+        return None
+
+
 def download_file(url):
-    # Добавляем авторизацию для скачивания из Битрикс
-    if "bitrix24.ru" in url:
-        # Извлекаем токен из BITRIX_WEBHOOK_URL
-        token = BITRIX_WEBHOOK_URL.rstrip("/").split("/")[-1]
-        separator = "&" if "?" in url else "?"
-        url = f"{url}{separator}auth={token}"
     r = requests.get(url, timeout=60)
     r.raise_for_status()
     return r.content
@@ -166,35 +175,27 @@ def bot_handler():
     if event not in ("ONIMBOTMESSAGEADD", "ONIMJOINCHAT"):
         return jsonify({"result": "ok"})
 
-    # Ищем PDF файл в данных от Битрикс
-    # Структура: data[PARAMS][FILES][ID][urlShow], data[PARAMS][FILES][ID][name]
-    pdf_url = None
-    file_ids = set()
-    for key in data.keys():
-        if "FILES" in key and key.endswith("][id]"):
-            parts = key.split("[")
-            # Берём ID файла
-            for i, p in enumerate(parts):
-                if p.startswith("FILES"):
-                    if i+1 < len(parts):
-                        fid = parts[i+1].rstrip("]")
-                        file_ids.add(fid)
-
-    for fid in file_ids:
-        name_key = f"data[PARAMS][FILES][{fid}][name]"
-        url_key = f"data[PARAMS][FILES][{fid}][urlDownload]"
-        url_key2 = f"data[PARAMS][FILES][{fid}][urlShow]"
-        fname = data.get(name_key, "")
-        if fname.lower().endswith(".pdf"):
-            pdf_url = data.get(url_key) or data.get(url_key2)
-            break
+    # Ищем ID файла PDF в данных от Битрикс
+    # Структура: data[PARAMS][FILES][0]: ID или data[PARAMS][FILES][ID][id]
+    pdf_file_id = None
     
-    # Запасной вариант — любой URL с FILES в ключе
-    if not pdf_url:
+    # Вариант 1: data[PARAMS][FILE_ID][0]
+    file_id_key = data.get("data[PARAMS][FILE_ID][0]")
+    if file_id_key:
+        pdf_file_id = file_id_key
+
+    # Вариант 2: data[PARAMS][FILES][ID][id]
+    if not pdf_file_id:
         for key, val in data.items():
-            if "FILES" in key and ("urlDownload" in key or "urlShow" in key) and val:
-                pdf_url = val
+            if "FILES" in key and key.endswith("][id]") and val:
+                pdf_file_id = val
                 break
+
+    # Получаем URL файла через Битрикс API
+    pdf_url = None
+    if pdf_file_id:
+        pdf_url = get_file_url_by_id(pdf_file_id)
+        print(f"FILE_ID: {pdf_file_id}, URL: {pdf_url}")
 
     if pdf_url:
         send_message(dialog_id, "📄 Получил выписку, обрабатываю... ~30 секунд.")
