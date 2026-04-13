@@ -126,37 +126,51 @@ def to_csv(transactions):
 
 @app.route("/bot", methods=["POST", "GET"])
 def bot_handler():
-    print(f"REQUEST: method={request.method} content_type={request.content_type}")
-    print(f"RAW: {request.get_data(as_text=True)[:500]}")
-
     if request.method == "GET":
-        return jsonify({"result": "ok", "status": "bot is running"})
+        return jsonify({"result": "ok"})
 
     data = parse_request_data()
-    print(f"PARSED DATA: {json.dumps(data)[:500]}")
+    print(f"PARSED DATA: {str(data)[:600]}")
 
     event = data.get("event", "")
-    event_data = data.get("data", {})
-    if isinstance(event_data, str):
-        try:
-            event_data = json.loads(event_data)
-        except:
-            event_data = {}
 
-    print(f"EVENT: {event}, DATA: {str(event_data)[:300]}")
+    # Битрикс присылает данные в data[PARAMS]
+    params = data.get("data[PARAMS]") or data.get("data", {})
+    if isinstance(params, str):
+        try:
+            params = json.loads(params)
+        except:
+            params = {}
+
+    # Достаём dialog_id
+    dialog_id = (
+        data.get("data[PARAMS][DIALOG_ID]") or
+        data.get("data[PARAMS][TO_CHAT_ID]") or
+        params.get("DIALOG_ID") or
+        params.get("TO_CHAT_ID")
+    )
+
+    message_text = str(
+        data.get("data[PARAMS][MESSAGE]") or
+        params.get("MESSAGE", "")
+    ).lower()
+
+    print(f"EVENT: {event}, DIALOG: {dialog_id}")
 
     if event not in ("ONIMBOTMESSAGEADD", "ONIMJOINCHAT"):
         return jsonify({"result": "ok"})
 
-    dialog_id = event_data.get("DIALOG_ID") or event_data.get("FROM_USER_ID")
-    message_text = str(event_data.get("MESSAGE", "")).lower()
-    files = event_data.get("FILES") or []
-
-    # Ищем PDF
+    # Ищем PDF файл в данных от Битрикс
     pdf_url = None
-    for f in files:
-        if isinstance(f, dict) and str(f.get("name", "")).lower().endswith(".pdf"):
-            pdf_url = f.get("urlDownload") or f.get("link") or f.get("url")
+    for key, val in data.items():
+        if "FILES" in key and key.endswith("[urlShow]"):
+            name_key = key.replace("[urlShow]", "[name]")
+            fname = data.get(name_key, "")
+            if fname.lower().endswith(".pdf"):
+                pdf_url = val
+                break
+        if "FILES" in key and key.endswith("[urlDownload]"):
+            pdf_url = val
             break
 
     if pdf_url:
