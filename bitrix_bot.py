@@ -11,14 +11,12 @@ import anthropic
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 
 # ВАЖНО:
-# После нажатия "Перегенерировать" в Bitrix вставь сюда НОВЫЙ webhook.
-BITRIX_WEBHOOK_URL = os.getenv(
-    "BITRIX_WEBHOOK_URL",
-    "https://joto.bitrix24.ru/rest/1/ge7hgsje88e51nuw"
-).rstrip("/")
+# Здесь стоит ТОЛЬКО входящий webhook №46.
+# Webhook №54 ("Передавать боту сообщения из чата") сюда НЕ ставится.
+BITRIX_WEBHOOK_URL = "https://joto.bitrix24.ru/rest/1/ge7hgsje88e51nuw".rstrip("/")
 
 DDS_CATEGORIES = [
     "Поступления от покупателей",
@@ -39,6 +37,17 @@ DDS_CATEGORIES = [
 ]
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+
+def safe_preview(value, limit=2000):
+    try:
+        text = str(value)
+    except Exception:
+        text = repr(value)
+
+    if len(text) > limit:
+        return text[:limit] + " ...[truncated]"
+    return text
 
 
 def parse_request_data():
@@ -67,31 +76,20 @@ def parse_request_data():
     return {}
 
 
-def safe_preview(value, limit=2000):
-    try:
-        text = str(value)
-    except Exception:
-        text = repr(value)
-
-    if len(text) > limit:
-        return text[:limit] + " ...[truncated]"
-    return text
-
-
 def bitrix_post(method_name, payload, timeout=20):
     url = f"{BITRIX_WEBHOOK_URL}/{method_name}.json"
-    r = requests.post(url, json=payload, timeout=timeout)
-    print(f"{method_name} POST status={r.status_code}")
-    print(f"{method_name} POST response={safe_preview(r.text, 3000)}")
-    return r
+    response = requests.post(url, json=payload, timeout=timeout)
+    print(f"{method_name} POST status={response.status_code}")
+    print(f"{method_name} POST response={safe_preview(response.text, 3000)}")
+    return response
 
 
 def bitrix_get(method_name, params=None, timeout=20):
     url = f"{BITRIX_WEBHOOK_URL}/{method_name}.json"
-    r = requests.get(url, params=params or {}, timeout=timeout)
-    print(f"{method_name} GET status={r.status_code}")
-    print(f"{method_name} GET response={safe_preview(r.text, 4000)}")
-    return r
+    response = requests.get(url, params=params or {}, timeout=timeout)
+    print(f"{method_name} GET status={response.status_code}")
+    print(f"{method_name} GET response={safe_preview(response.text, 4000)}")
+    return response
 
 
 def send_message(dialog_id, text):
@@ -160,24 +158,21 @@ def find_pdf_in_payload(data):
 
 
 def get_disk_file_info(file_id):
-    try:
-        r = bitrix_get("disk.file.get", params={"id": file_id}, timeout=20)
+    response = bitrix_get("disk.file.get", params={"id": file_id}, timeout=20)
 
-        if r.status_code != 200:
-            raise ValueError(f"disk.file.get returned HTTP {r.status_code}")
+    if response.status_code != 200:
+        raise ValueError(f"disk.file.get вернул HTTP {response.status_code}")
 
-        payload = r.json()
-        if "error" in payload:
-            raise ValueError(payload.get("error_description") or payload.get("error"))
+    payload = response.json()
 
-        result = payload.get("result", {})
-        if not result:
-            raise ValueError("disk.file.get вернул пустой result")
+    if "error" in payload:
+        raise ValueError(payload.get("error_description") or payload.get("error"))
 
-        return result
+    result = payload.get("result", {})
+    if not result:
+        raise ValueError("disk.file.get вернул пустой result")
 
-    except Exception as e:
-        raise ValueError(f"Не удалось получить информацию о файле через disk.file.get: {e}")
+    return result
 
 
 def extract_download_url_from_disk_info(file_info):
@@ -211,34 +206,52 @@ def download_pdf(url):
         "Accept": "application/pdf,application/octet-stream,*/*",
     }
 
+    response = session.get(url, headers=headers, timeout=60, allow_redirects=True)
+    content_type = (response.headers.get("Content-Type") or "").lower()
+
+    print(f"download_pdf status={response.status_code}")
+    print(f"download_pdf final_url={safe_preview(response.url, 500)}")
+    print(f"download_pdf content_type={content_type}")
+    print(f"download_pdf first_bytes={response.content[:20]}")
+
+    if response.status_code != 200:
+        raise ValueError(f"Ошибка скачивания PDF: HTTP {response.status_code}")
+
+    if "application/pdf" in content_type or response.content.startswith(b"%PDF"):
+        return response.content
+
+    preview = ""
     try:
-        r = session.get(url, headers=headers, timeout=60, allow_redirects=True)
-        content_type = (r.headers.get("Content-Type") or "").lower()
+        preview = response.text[:1000].replace("\n", " ")
+    except Exception:
+        preview = str(response.content[:200])
 
-        print(f"download_pdf status={r.status_code}")
-        print(f"download_pdf final_url={safe_preview(r.url, 500)}")
-        print(f"download_pdf content_type={content_type}")
-        print(f"download_pdf first_bytes={r.content[:20]}")
+    raise ValueError(f"Получили не PDF, а {content_type}: {preview}")
 
-        if r.status_code != 200:
-            raise ValueError(f"HTTP {r.status_code}")
 
-        if "application/pdf" in content_type or r.content.startswith(b"%PDF"):
-            return r.content
+def get_pdf_bytes(file_id, fallback_url=None):
+    disk_info = get_disk_file_info(file_id)
+    print("===== DISK FILE INFO =====")
+    print(safe_preview(disk_info, 5000))
 
-        preview = ""
-        try:
-            preview = r.text[:1000].replace("\n", " ")
-        except Exception:
-            preview = str(r.content[:200])
+    download_url = extract_download_url_from_disk_info(disk_info)
 
-        raise ValueError(f"Получили не PDF, а {content_type}: {preview}")
+    if download_url:
+        print(f"DOWNLOAD URL FROM DISK: {safe_preview(download_url, 1000)}")
+        return download_pdf(download_url)
 
-    except Exception as e:
-        raise ValueError(f"Ошибка скачивания PDF: {e}")
+    if fallback_url:
+        print("DOWNLOAD URL from disk.file.get not found, trying fallback urlDownload")
+        print(f"FALLBACK URL: {safe_preview(fallback_url, 1000)}")
+        return download_pdf(fallback_url)
+
+    raise ValueError("Не найдена ссылка на скачивание PDF")
 
 
 def extract_transactions(pdf_bytes):
+    if not ANTHROPIC_API_KEY:
+        raise ValueError("Не указан ANTHROPIC_API_KEY")
+
     pdf_b64 = base64.b64encode(pdf_bytes).decode()
 
     system_prompt = f"""Из банковской выписки извлеки транзакции и распредели по статьям ДДС.
@@ -348,22 +361,13 @@ def bot_handler():
 
     file_id = file_info.get("file_id")
     filename = file_info.get("filename") or "document.pdf"
+    fallback_url = file_info.get("url_download")
 
     if filename.lower().endswith(".pdf") and file_id:
         send_message(dialog_id, "📄 Получил PDF, начинаю обработку...")
 
         try:
-            disk_info = get_disk_file_info(file_id)
-            print("===== DISK FILE INFO =====")
-            print(safe_preview(disk_info, 5000))
-
-            download_url = extract_download_url_from_disk_info(disk_info)
-            if not download_url:
-                raise ValueError("В ответе disk.file.get не найдена ссылка DOWNLOAD_URL")
-
-            print(f"DOWNLOAD URL: {safe_preview(download_url, 1000)}")
-
-            pdf_bytes = download_pdf(download_url)
+            pdf_bytes = get_pdf_bytes(file_id, fallback_url=fallback_url)
 
             send_message(dialog_id, "🔍 Анализирую выписку через ИИ...")
 
