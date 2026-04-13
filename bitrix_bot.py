@@ -99,7 +99,7 @@ def send_message(dialog_id, text):
         return
     try:
         bitrix_post(
-            "imbot.message.add",
+            "im.message.add",
             {"DIALOG_ID": dialog_id, "MESSAGE": text},
             timeout=15,
         )
@@ -248,6 +248,15 @@ def download_pdf(url):
 
 
 def get_pdf_bytes(file_id, fallback_url=None):
+    # Сначала пробуем использовать готовый urlDownload из payload (без лишнего API-запроса)
+    if fallback_url:
+        print(f"Using fallback_url directly: {safe_preview(fallback_url, 500)}")
+        try:
+            return download_pdf(fallback_url)
+        except Exception as e:
+            print(f"fallback_url failed: {e}, trying disk.file.get...")
+
+    # Если не сработало — идём через disk.file.get
     disk_info = get_disk_file_info(file_id)
     print("===== DISK FILE INFO =====")
     print(safe_preview(disk_info, 5000))
@@ -257,10 +266,6 @@ def get_pdf_bytes(file_id, fallback_url=None):
     if download_url:
         print(f"DOWNLOAD URL FROM DISK: {safe_preview(download_url, 500)}")
         return download_pdf(download_url)
-
-    if fallback_url:
-        print("DOWNLOAD URL not found in disk.file.get, trying fallback")
-        return download_pdf(fallback_url)
 
     raise ValueError("Не найдена ссылка на скачивание PDF")
 
