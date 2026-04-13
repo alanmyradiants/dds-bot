@@ -84,11 +84,41 @@ def send_file(dialog_id, filename, content_bytes):
         print(f"send_file error: {e}")
 
 
-def get_file_url_by_id(file_id):
-    """Строим URL напрямую через show_file.php"""
+def get_file_download_url(file_id, chat_id, unified_link=None):
+    """Получаем рабочую ссылку для скачивания файла"""
     parts = BITRIX_WEBHOOK_URL.rstrip("/").split("/")
     token = parts[-1]
     domain = "/".join(parts[:3])
+
+    # Способ 1: im.chat.files.get — получаем файлы чата с disk ID
+    try:
+        r = requests.get(
+            f"{BITRIX_WEBHOOK_URL}/im.chat.files.get.json",
+            params={"CHAT_ID": chat_id, "LIMIT": 20},
+            timeout=10
+        )
+        result = r.json().get("result", {})
+        print(f"im.chat.files.get: {str(result)[:300]}")
+        files = result.get("files", [])
+        for f in files:
+            if str(f.get("id")) == str(file_id):
+                disk_id = f.get("diskId") or f.get("DISK_ID")
+                if disk_id:
+                    r2 = requests.get(f"{BITRIX_WEBHOOK_URL}/disk.file.get.json", params={"id": disk_id}, timeout=10)
+                    disk_result = r2.json().get("result", {})
+                    print(f"disk.file.get by diskId: {str(disk_result)[:200]}")
+                    if disk_result.get("DOWNLOAD_URL"):
+                        return disk_result["DOWNLOAD_URL"]
+    except Exception as e:
+        print(f"im.chat.files.get error: {e}")
+
+    # Способ 2: unifiedLink с токеном
+    if unified_link:
+        url = f"{unified_link}?auth={token}" if "?" not in unified_link else f"{unified_link}&auth={token}"
+        print(f"Trying unifiedLink: {url[:100]}")
+        return url
+
+    # Способ 3: прямой URL через download.file.php
     return f"{domain}/bitrix/components/bitrix/im.messenger/download.file.php?fileId={file_id}&auth={token}"
 
 
@@ -197,25 +227,25 @@ def bot_handler():
 
     pdf_file_id = None
     pdf_url_direct = None
+    pdf_chat_id = None
+    pdf_unified_link = None
 
-    # Ищем прямой URL скачивания
+    # Ищем данные файла
     for key, val in data.items():
         if "FILES" in key and key.endswith("][urlDownload]") and val:
             name_key = key.replace("][urlDownload]", "][name]")
             fname = data.get(name_key, ".pdf")
             if fname.lower().endswith(".pdf"):
                 pdf_url_direct = val
+                # Берём chatId и unifiedLink
+                chat_key = key.replace("][urlDownload]", "][chatId]")
+                pdf_chat_id = data.get(chat_key)
+                unified_key = key.replace("][urlDownload]", "][viewerAttrs][unifiedLink]")
+                pdf_unified_link = data.get(unified_key)
+                # Берём file ID
+                id_key = key.replace("][urlDownload]", "][id]")
+                pdf_file_id = data.get(id_key)
                 break
-
-    # Также пробуем unifiedLink
-    if not pdf_url_direct:
-        for key, val in data.items():
-            if "FILES" in key and key.endswith("][unifiedLink]") and val:
-                name_key = key.replace("][unifiedLink]", "][name]")
-                fname = data.get(name_key, ".pdf")
-                if fname.lower().endswith(".pdf"):
-                    pdf_url_direct = val
-                    break
 
     # Если urlDownload не нашли — берём FILE_ID
     if not pdf_url_direct:
@@ -232,19 +262,13 @@ def bot_handler():
 
     # Получаем URL файла
     pdf_url = None
-    if pdf_url_direct:
+    if pdf_file_id:
+        pdf_url = get_file_download_url(pdf_file_id, pdf_chat_id, pdf_unified_link)
+        print(f"RESOLVED URL: {str(pdf_url)[:100]}")
+    elif pdf_url_direct:
         parts = BITRIX_WEBHOOK_URL.rstrip("/").split("/")
         token = parts[-1]
-        domain = "/".join(parts[:3])
-        # Если URL относительный — добавляем домен
-        if pdf_url_direct.startswith("/"):
-            pdf_url = domain + pdf_url_direct + f"&auth={token}"
-        else:
-            pdf_url = pdf_url_direct + f"&auth={token}"
-        print(f"DIRECT URL: {pdf_url[:100]}")
-    elif pdf_file_id:
-        pdf_url = get_file_url_by_id(pdf_file_id)
-        print(f"FILE_ID: {pdf_file_id}, URL: {pdf_url}")
+        pdf_url = pdf_url_direct + f"&auth={token}"
 
     if pdf_url:
         send_message(dialog_id, "📄 Получил выписку, обрабатываю... ~30 секунд.")
