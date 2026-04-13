@@ -95,16 +95,30 @@ def get_file_url_by_id(file_id):
 def download_file(url):
     parts = BITRIX_WEBHOOK_URL.rstrip("/").split("/")
     token = parts[-1]
-    # Пробуем с токеном и без
-    for attempt_url in [url, url + f"&auth={token}" if "?" in url else url + f"?auth={token}"]:
-        try:
-            r = requests.get(attempt_url, timeout=60, allow_redirects=True)
-            print(f"Download status={r.status_code} size={len(r.content)} first_bytes={r.content[:8]}")
-            if r.status_code == 200 and len(r.content) > 100:
-                return r.content
-        except Exception as e:
-            print(f"Download error: {e}")
-    raise ValueError("Не удалось скачать файл")
+    
+    # Пробуем с токеном в заголовке
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        r = requests.get(url, headers=headers, timeout=60, allow_redirects=True)
+        print(f"Download status={r.status_code} size={len(r.content)} first_bytes={r.content[:8]}")
+        if r.status_code == 200 and r.content[:4] == b"%PDF":
+            return r.content
+    except Exception as e:
+        print(f"Download error: {e}")
+
+    # Пробуем с токеном в URL параметре
+    sep = "&" if "?" in url else "?"
+    url_with_auth = f"{url}{sep}auth={token}"
+    try:
+        r = requests.get(url_with_auth, timeout=60, allow_redirects=True)
+        print(f"Download2 status={r.status_code} size={len(r.content)} first_bytes={r.content[:8]}")
+        if r.status_code == 200 and r.content[:4] == b"%PDF":
+            return r.content
+    except Exception as e:
+        print(f"Download2 error: {e}")
+
+    # Пробуем через unifiedLink из данных Битрикс
+    raise ValueError(f"Не удалось скачать PDF. Получили: {r.content[:50]}")
 
 
 def extract_transactions(pdf_bytes):
@@ -184,15 +198,24 @@ def bot_handler():
     pdf_file_id = None
     pdf_url_direct = None
 
-    # Битрикс присылает urlDownload прямо в данных
+    # Ищем прямой URL скачивания
     for key, val in data.items():
         if "FILES" in key and key.endswith("][urlDownload]") and val:
-            # Проверяем что это PDF
             name_key = key.replace("][urlDownload]", "][name]")
             fname = data.get(name_key, ".pdf")
             if fname.lower().endswith(".pdf"):
                 pdf_url_direct = val
                 break
+
+    # Также пробуем unifiedLink
+    if not pdf_url_direct:
+        for key, val in data.items():
+            if "FILES" in key and key.endswith("][unifiedLink]") and val:
+                name_key = key.replace("][unifiedLink]", "][name]")
+                fname = data.get(name_key, ".pdf")
+                if fname.lower().endswith(".pdf"):
+                    pdf_url_direct = val
+                    break
 
     # Если urlDownload не нашли — берём FILE_ID
     if not pdf_url_direct:
