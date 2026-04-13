@@ -86,6 +86,22 @@ def send_file(dialog_id, filename, content_bytes):
 
 def get_file_url_by_id(file_id):
     """Получаем ссылку на файл через Битрикс API"""
+    # Пробуем im.disk.file.get (файлы из чата)
+    try:
+        r = requests.get(
+            f"{BITRIX_WEBHOOK_URL}/im.disk.file.get.json",
+            params={"FILE_ID": file_id},
+            timeout=10
+        )
+        result = r.json().get("result", {})
+        print(f"im.disk.file.get result: {result}")
+        url = result.get("DOWNLOAD_URL") or result.get("URL") or result.get("LINK")
+        if url:
+            return url
+    except Exception as e:
+        print(f"im.disk.file.get error: {e}")
+
+    # Пробуем disk.file.get
     try:
         r = requests.get(
             f"{BITRIX_WEBHOOK_URL}/disk.file.get.json",
@@ -93,9 +109,10 @@ def get_file_url_by_id(file_id):
             timeout=10
         )
         result = r.json().get("result", {})
+        print(f"disk.file.get result: {result}")
         return result.get("DOWNLOAD_URL") or result.get("DETAIL_URL")
     except Exception as e:
-        print(f"get_file_url error: {e}")
+        print(f"disk.file.get error: {e}")
         return None
 
 
