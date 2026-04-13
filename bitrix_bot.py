@@ -14,7 +14,7 @@ app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 
 ANTHROPIC_API_KEY      = os.getenv("ANTHROPIC_API_KEY", "").strip()
 # Вебхук с imbot-скоупом — для отправки сообщений
-BITRIX_WEBHOOK_URL     = os.getenv("BITRIX_WEBHOOK_URL", "https://joto.bitrix24.ru/rest/1/ge7hgsje88e51nuw").rstrip("/")
+BITRIX_WEBHOOK_URL     = os.getenv("BITRIX_WEBHOOK_URL", "https://joto.bitrix24.ru/rest/1/9pkspu2vkwp1zkrs").rstrip("/")
 # Отдельный вебхук только с disk-скоупом — для скачивания файлов
 # Создайте новый входящий вебхук в Bitrix24 с правом "Диск (disk)" и вставьте URL сюда
 BITRIX_DISK_WEBHOOK_URL = os.getenv("BITRIX_DISK_WEBHOOK_URL", BITRIX_WEBHOOK_URL).rstrip("/")
