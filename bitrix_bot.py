@@ -85,41 +85,49 @@ def send_file(dialog_id, filename, content_bytes):
 
 
 def get_file_url_by_id(file_id):
-    """Получаем ссылку на файл через Битрикс API"""
-    # Пробуем im.disk.file.get (файлы из чата)
-    try:
-        r = requests.get(
-            f"{BITRIX_WEBHOOK_URL}/im.disk.file.get.json",
-            params={"FILE_ID": file_id},
-            timeout=10
-        )
-        result = r.json().get("result", {})
-        print(f"im.disk.file.get result: {result}")
-        url = result.get("DOWNLOAD_URL") or result.get("URL") or result.get("LINK")
-        if url:
-            return url
-    except Exception as e:
-        print(f"im.disk.file.get error: {e}")
+    """Получаем ссылку на файл — строим URL напрямую"""
+    # Извлекаем домен и токен из BITRIX_WEBHOOK_URL
+    # URL вида: https://joto.bitrix24.ru/rest/1/TOKEN/
+    parts = BITRIX_WEBHOOK_URL.rstrip("/").split("/")
+    token = parts[-1]
+    domain = "/".join(parts[:3])  # https://joto.bitrix24.ru
 
-    # Пробуем disk.file.get
-    try:
-        r = requests.get(
-            f"{BITRIX_WEBHOOK_URL}/disk.file.get.json",
-            params={"id": file_id},
-            timeout=10
-        )
-        result = r.json().get("result", {})
-        print(f"disk.file.get result: {result}")
-        return result.get("DOWNLOAD_URL") or result.get("DETAIL_URL")
-    except Exception as e:
-        print(f"disk.file.get error: {e}")
-        return None
+    # Пробуем разные варианты URL для скачивания файла из IM
+    urls_to_try = [
+        f"{domain}/bitrix/components/bitrix/im.messenger/show_file.php?fileId={file_id}&auth={token}",
+        f"{domain}/rest/1/{token}/im.disk.file.get.json?FILE_ID={file_id}",
+        f"{domain}/download.php?id={file_id}&auth={token}",
+    ]
+
+    for url in urls_to_try:
+        try:
+            r = requests.get(url, timeout=10, allow_redirects=True)
+            content_type = r.headers.get("content-type", "")
+            print(f"Trying URL: {url[:80]} -> status={r.status_code} ct={content_type[:50]}")
+            if r.status_code == 200 and "application/pdf" in content_type:
+                return url
+            if r.status_code == 200 and len(r.content) > 1000 and b"%PDF" in r.content[:10]:
+                return url
+        except Exception as e:
+            print(f"URL try error: {e}")
+
+    # Возвращаем первый вариант на попытку
+    return urls_to_try[0]
 
 
 def download_file(url):
-    r = requests.get(url, timeout=60)
-    r.raise_for_status()
-    return r.content
+    parts = BITRIX_WEBHOOK_URL.rstrip("/").split("/")
+    token = parts[-1]
+    # Пробуем с токеном и без
+    for attempt_url in [url, url + f"&auth={token}" if "?" in url else url + f"?auth={token}"]:
+        try:
+            r = requests.get(attempt_url, timeout=60, allow_redirects=True)
+            print(f"Download status={r.status_code} size={len(r.content)} first_bytes={r.content[:8]}")
+            if r.status_code == 200 and len(r.content) > 100:
+                return r.content
+        except Exception as e:
+            print(f"Download error: {e}")
+    raise ValueError("Не удалось скачать файл")
 
 
 def extract_transactions(pdf_bytes):
@@ -192,9 +200,9 @@ def bot_handler():
     if event not in ("ONIMBOTMESSAGEADD", "ONIMJOINCHAT"):
         return jsonify({"result": "ok"})
 
-    # Ищем ID файла PDF в данных от Битрикс
-    # Структура: data[PARAMS][FILES][0]: ID или data[PARAMS][FILES][ID][id]
-    pdf_file_id = None
+    # Логируем все ключи связанные с файлами
+    file_keys = {k: v for k, v in data.items() if "FILE" in k.upper()}
+    print(f"ALL FILE KEYS: {file_keys}")
     
     # Вариант 1: data[PARAMS][FILE_ID][0]
     file_id_key = data.get("data[PARAMS][FILE_ID][0]")
