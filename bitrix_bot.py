@@ -85,6 +85,12 @@ def send_file(dialog_id, filename, content_bytes):
 
 
 def download_file(url):
+    # Добавляем авторизацию для скачивания из Битрикс
+    if "bitrix24.ru" in url:
+        # Извлекаем токен из BITRIX_WEBHOOK_URL
+        token = BITRIX_WEBHOOK_URL.rstrip("/").split("/")[-1]
+        separator = "&" if "?" in url else "?"
+        url = f"{url}{separator}auth={token}"
     r = requests.get(url, timeout=60)
     r.raise_for_status()
     return r.content
@@ -161,17 +167,34 @@ def bot_handler():
         return jsonify({"result": "ok"})
 
     # Ищем PDF файл в данных от Битрикс
+    # Структура: data[PARAMS][FILES][ID][urlShow], data[PARAMS][FILES][ID][name]
     pdf_url = None
-    for key, val in data.items():
-        if "FILES" in key and key.endswith("[urlShow]"):
-            name_key = key.replace("[urlShow]", "[name]")
-            fname = data.get(name_key, "")
-            if fname.lower().endswith(".pdf"):
+    file_ids = set()
+    for key in data.keys():
+        if "FILES" in key and key.endswith("][id]"):
+            parts = key.split("[")
+            # Берём ID файла
+            for i, p in enumerate(parts):
+                if p.startswith("FILES"):
+                    if i+1 < len(parts):
+                        fid = parts[i+1].rstrip("]")
+                        file_ids.add(fid)
+
+    for fid in file_ids:
+        name_key = f"data[PARAMS][FILES][{fid}][name]"
+        url_key = f"data[PARAMS][FILES][{fid}][urlDownload]"
+        url_key2 = f"data[PARAMS][FILES][{fid}][urlShow]"
+        fname = data.get(name_key, "")
+        if fname.lower().endswith(".pdf"):
+            pdf_url = data.get(url_key) or data.get(url_key2)
+            break
+    
+    # Запасной вариант — любой URL с FILES в ключе
+    if not pdf_url:
+        for key, val in data.items():
+            if "FILES" in key and ("urlDownload" in key or "urlShow" in key) and val:
                 pdf_url = val
                 break
-        if "FILES" in key and key.endswith("[urlDownload]"):
-            pdf_url = val
-            break
 
     if pdf_url:
         send_message(dialog_id, "📄 Получил выписку, обрабатываю... ~30 секунд.")
