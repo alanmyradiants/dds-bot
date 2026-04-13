@@ -203,7 +203,9 @@ def bot_handler():
     # Логируем все ключи связанные с файлами
     file_keys = {k: v for k, v in data.items() if "FILE" in k.upper()}
     print(f"ALL FILE KEYS: {file_keys}")
-    
+
+    pdf_file_id = None
+
     # Вариант 1: data[PARAMS][FILE_ID][0]
     file_id_key = data.get("data[PARAMS][FILE_ID][0]")
     if file_id_key:
