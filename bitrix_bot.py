@@ -1,30 +1,18 @@
-"""
-Битрикс24 бот: PDF выписка → CSV для ДДС
-==========================================
-Установка:
-  pip install flask requests anthropic
-
-Запуск:
-  python bot.py
-
-Для продакшена нужен публичный URL (Railway, Render, VPS).
-"""
-
 import os
 import io
 import csv
 import json
-import tempfile
+import base64
 import requests
+from urllib.parse import parse_qs
 from flask import Flask, request, jsonify
 import anthropic
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 
-# === НАСТРОЙКИ (заполните своими данными) ===
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "sk-ant-ВАШИ_КЛЮЧ")
-BITRIX_WEBHOOK_URL = os.getenv("BITRIX_WEBHOOK_URL", "https://ВАШИ_ПОРТАЛ.bitrix24.ru/rest/1/ВАШИ_ТОКЕН")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")  # токен бота из Битрикс
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+BITRIX_WEBHOOK_URL = os.getenv("BITRIX_WEBHOOK_URL", "")
 
 DDS_CATEGORIES = [
     "Поступления от покупателей",
@@ -47,179 +35,155 @@ DDS_CATEGORIES = [
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
+def parse_request_data():
+    """Парсим данные запроса в любом формате"""
+    # Пробуем JSON
+    try:
+        if request.is_json:
+            return request.get_json(force=True) or {}
+    except:
+        pass
+    # Пробуем form data
+    if request.form:
+        return request.form.to_dict()
+    # Пробуем raw body
+    raw = request.get_data(as_text=True)
+    if raw:
+        try:
+            return json.loads(raw)
+        except:
+            pass
+        try:
+            parsed = parse_qs(raw)
+            return {k: v[0] for k, v in parsed.items()}
+        except:
+            pass
+    return {}
+
+
 def send_message(dialog_id, text):
-    """Отправить текстовое сообщение в чат Битрикс"""
-    requests.post(f"{BITRIX_WEBHOOK_URL}/im.message.add.json", json={
-        "DIALOG_ID": dialog_id,
-        "MESSAGE": text,
-    })
+    try:
+        requests.post(
+            f"{BITRIX_WEBHOOK_URL}/im.message.add.json",
+            json={"DIALOG_ID": dialog_id, "MESSAGE": text},
+            timeout=10
+        )
+    except Exception as e:
+        print(f"send_message error: {e}")
 
 
 def send_file(dialog_id, filename, content_bytes):
-    """Отправить файл в чат Битрикс через disk.file.uploadbyurl или прямую загрузку"""
-    # Загружаем файл через im.disk.file.commit
-    import base64
-    encoded = base64.b64encode(content_bytes).decode()
-    requests.post(f"{BITRIX_WEBHOOK_URL}/im.disk.file.commit.json", json={
-        "DIALOG_ID": dialog_id,
-        "FILE_NAME": filename,
-        "FILE_CONTENT": encoded,
-    })
+    try:
+        encoded = base64.b64encode(content_bytes).decode()
+        requests.post(
+            f"{BITRIX_WEBHOOK_URL}/im.disk.file.commit.json",
+            json={"DIALOG_ID": dialog_id, "FILE_NAME": filename, "FILE_CONTENT": encoded},
+            timeout=30
+        )
+    except Exception as e:
+        print(f"send_file error: {e}")
 
 
 def download_file(url):
-    """Скачать файл из Битрикс (с авторизацией через webhook)"""
-    # Добавляем токен если нужно
-    response = requests.get(url, timeout=30)
-    return response.content
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    return r.content
 
 
-def extract_transactions_from_pdf(pdf_bytes):
-    """Отправить PDF в Claude API и получить транзакции"""
-    import base64
+def extract_transactions(pdf_bytes):
     pdf_b64 = base64.b64encode(pdf_bytes).decode()
+    system_prompt = f"""Из банковской выписки извлеки транзакции и распредели по статьям ДДС.
+Статьи: {', '.join(DDS_CATEGORIES)}
+Верни ТОЛЬКО JSON массив:
+[{{"date":"ДД.ММ.ГГГГ","description":"текст","amount":100.0,"type":"in","category":"статья","counterparty":"контрагент"}}]
+type: in=поступление, out=списание. amount всегда положительное."""
 
-    system_prompt = f"""Ты — финансовый аналитик. Из банковской выписки Сбербанка извлеки все транзакции и распредели их по статьям ДДС.
-
-Доступные статьи ДДС:
-{chr(10).join(DDS_CATEGORIES)}
-
-Верни ТОЛЬКО валидный JSON массив (без markdown, без текста):
-[
-  {{
-    "date": "ДД.ММ.ГГГГ",
-    "description": "Краткое описание",
-    "amount": 12345.67,
-    "type": "in",
-    "category": "Одна из статей ДДС выше",
-    "counterparty": "Название контрагента"
-  }}
-]
-
-Правила:
-- amount всегда положительное число
-- type: "in" для поступлений, "out" для списаний
-- Игнорируй строки с балансом/остатком, только движения"""
-
-    message = client.messages.create(
+    msg = client.messages.create(
         model="claude-opus-4-5",
         max_tokens=8000,
         system=system_prompt,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "document",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "application/pdf",
-                            "data": pdf_b64,
-                        },
-                    },
-                    {"type": "text", "text": "Извлеки все транзакции и распредели по статьям ДДС."},
-                ],
-            }
-        ],
+        messages=[{"role": "user", "content": [
+            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64}},
+            {"type": "text", "text": "Извлеки все транзакции."}
+        ]}]
     )
-
-    text = message.content[0].text
-    start = text.find("[")
-    end = text.rfind("]")
-    if start == -1 or end == -1:
-        raise ValueError("Не удалось найти транзакции в ответе")
-
-    return json.loads(text[start:end + 1])
+    text = msg.content[0].text
+    start, end = text.find("["), text.rfind("]")
+    if start == -1: raise ValueError("Транзакции не найдены")
+    return json.loads(text[start:end+1])
 
 
-def transactions_to_csv(transactions):
-    """Преобразовать список транзакций в CSV байты"""
-    output = io.StringIO()
-    writer = csv.writer(output, delimiter=";", quoting=csv.QUOTE_ALL)
-
-    writer.writerow(["Дата", "Контрагент", "Описание", "Приход", "Расход", "Статья ДДС"])
-
+def to_csv(transactions):
+    out = io.StringIO()
+    w = csv.writer(out, delimiter=";", quoting=csv.QUOTE_ALL)
+    w.writerow(["Дата", "Контрагент", "Описание", "Приход", "Расход", "Статья ДДС"])
     for t in transactions:
         inc = f"{t['amount']:.2f}" if t.get("type") == "in" else ""
         exp = f"{t['amount']:.2f}" if t.get("type") == "out" else ""
-        writer.writerow([
-            t.get("date", ""),
-            t.get("counterparty", ""),
-            t.get("description", ""),
-            inc,
-            exp,
-            t.get("category", ""),
-        ])
-
-    # UTF-8 с BOM для корректного открытия в Excel
-    return ("\ufeff" + output.getvalue()).encode("utf-8")
+        w.writerow([t.get("date",""), t.get("counterparty",""), t.get("description",""), inc, exp, t.get("category","")])
+    return ("\ufeff" + out.getvalue()).encode("utf-8")
 
 
-@app.route("/bot", methods=["POST"])
+@app.route("/bot", methods=["POST", "GET"])
 def bot_handler():
-    """Основной обработчик событий от Битрикс24"""
-    data = request.json or request.form.to_dict()
+    print(f"REQUEST: method={request.method} content_type={request.content_type}")
+    print(f"RAW: {request.get_data(as_text=True)[:500]}")
+
+    if request.method == "GET":
+        return jsonify({"result": "ok", "status": "bot is running"})
+
+    data = parse_request_data()
+    print(f"PARSED DATA: {json.dumps(data)[:500]}")
 
     event = data.get("event", "")
     event_data = data.get("data", {})
+    if isinstance(event_data, str):
+        try:
+            event_data = json.loads(event_data)
+        except:
+            event_data = {}
 
-    # Обрабатываем только входящие сообщения
+    print(f"EVENT: {event}, DATA: {str(event_data)[:300]}")
+
     if event not in ("ONIMBOTMESSAGEADD", "ONIMJOINCHAT"):
         return jsonify({"result": "ok"})
 
     dialog_id = event_data.get("DIALOG_ID") or event_data.get("FROM_USER_ID")
-    message_text = event_data.get("MESSAGE", "").lower()
-    attach = event_data.get("ATTACH", [])
-    files = event_data.get("FILES", [])
+    message_text = str(event_data.get("MESSAGE", "")).lower()
+    files = event_data.get("FILES") or []
 
-    # Ищем PDF вложение
+    # Ищем PDF
     pdf_url = None
-    pdf_name = "выписка.pdf"
-
-    for f in (files or []):
-        name = f.get("name", "").lower()
-        if name.endswith(".pdf"):
-            pdf_url = f.get("urlDownload") or f.get("link")
-            pdf_name = f.get("name", pdf_name)
+    for f in files:
+        if isinstance(f, dict) and str(f.get("name", "")).lower().endswith(".pdf"):
+            pdf_url = f.get("urlDownload") or f.get("link") or f.get("url")
             break
 
-    # Если прислали PDF — обрабатываем
     if pdf_url:
-        send_message(dialog_id, "📄 Получил выписку, обрабатываю... Это займёт ~30 секунд.")
+        send_message(dialog_id, "📄 Получил выписку, обрабатываю... ~30 секунд.")
         try:
             pdf_bytes = download_file(pdf_url)
-            send_message(dialog_id, "🔍 Анализирую транзакции через ИИ...")
-
-            transactions = extract_transactions_from_pdf(pdf_bytes)
-
+            send_message(dialog_id, "🔍 Анализирую через ИИ...")
+            transactions = extract_transactions(pdf_bytes)
             total_in = sum(t["amount"] for t in transactions if t.get("type") == "in")
             total_out = sum(t["amount"] for t in transactions if t.get("type") == "out")
-
-            csv_bytes = transactions_to_csv(transactions)
-
-            # Отправляем статистику
+            csv_bytes = to_csv(transactions)
             send_message(dialog_id,
-                f"✅ Готово! Обработано {len(transactions)} транзакций\n"
+                f"✅ Готово! {len(transactions)} транзакций\n"
                 f"📈 Поступления: {total_in:,.2f} ₽\n"
-                f"📉 Списания: {total_out:,.2f} ₽\n"
-                f"📎 Отправляю CSV файл..."
+                f"📉 Списания: {total_out:,.2f} ₽"
             )
-
-            # Отправляем CSV файл
             send_file(dialog_id, "ДДС_выписка.csv", csv_bytes)
-
         except Exception as e:
-            send_message(dialog_id, f"❌ Ошибка при обработке: {str(e)}\nПопробуйте ещё раз или пришлите другой файл.")
-
-    elif message_text in ("привет", "start", "/start", "помощь", "help"):
+            print(f"ERROR: {e}")
+            send_message(dialog_id, f"❌ Ошибка: {str(e)}")
+    elif message_text in ("привет", "start", "/start", "помощь", "help", ""):
         send_message(dialog_id,
-            "👋 Привет! Я бот для обработки банковских выписок.\n\n"
-            "📌 Как использовать:\n"
-            "Просто пришлите PDF-выписку из Сбербанка — я автоматически распределю все транзакции по статьям ДДС и верну вам готовый CSV файл для 1С.\n\n"
-            "📂 Поддерживается: выписки Сбербанк в формате PDF"
+            "👋 Привет! Пришлите PDF-выписку из Сбербанка — "
+            "я распределю транзакции по статьям ДДС и верну CSV для 1С."
         )
     else:
-        send_message(dialog_id, "Пришлите PDF-выписку из Сбербанка, и я подготовлю CSV для ДДС.")
+        send_message(dialog_id, "Пришлите PDF-выписку из Сбербанка.")
 
     return jsonify({"result": "ok"})
 
@@ -231,4 +195,4 @@ def health():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=True)
