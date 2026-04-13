@@ -196,16 +196,16 @@ def bot_handler():
 
     # Если urlDownload не нашли — берём FILE_ID
     if not pdf_url_direct:
-    file_id_key = data.get("data[PARAMS][FILE_ID][0]")
-    if file_id_key:
-        pdf_file_id = file_id_key
+        file_id_key = data.get("data[PARAMS][FILE_ID][0]")
+        if file_id_key:
+            pdf_file_id = file_id_key
 
-    # Вариант 2: data[PARAMS][FILES][ID][id]
-    if not pdf_file_id:
-        for key, val in data.items():
-            if "FILES" in key and key.endswith("][id]") and val:
-                pdf_file_id = val
-                break
+        # Вариант 2: data[PARAMS][FILES][ID][id]
+        if not pdf_file_id:
+            for key, val in data.items():
+                if "FILES" in key and key.endswith("][id]") and val:
+                    pdf_file_id = val
+                    break
 
     # Получаем URL файла
     pdf_url = None
