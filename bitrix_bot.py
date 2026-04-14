@@ -5,6 +5,7 @@ import json
 import base64
 import threading
 import requests
+from datetime import datetime
 from urllib.parse import parse_qs
 from flask import Flask, request, jsonify
 import anthropic
@@ -121,15 +122,11 @@ def send_file(dialog_id, filename, content_bytes):
         print(f"[disk] storage.getlist status={storage_resp.status_code}")
         storages = storage_resp.json().get("result", [])
 
-        # Берём общий диск (TYPE=common) или первое хранилище
-        user_storage = next((s for s in storages if str(s.get("TYPE")) == "common"), None)
-        if not user_storage:
-            user_storage = next((s for s in storages if str(s.get("TYPE")) == "1"), None)
+        user_storage = next((s for s in storages if s.get("ENTITY_TYPE") == "common"), None)
         if not user_storage and storages:
             user_storage = storages[0]
 
         if not user_storage:
-            print("[disk] хранилище не найдено")
             raise Exception("Хранилище не найдено")
 
         root_folder_id = user_storage.get("ROOT_OBJECT_ID") or user_storage.get("ID")
@@ -141,25 +138,24 @@ def send_file(dialog_id, filename, content_bytes):
             data={"id": root_folder_id, "data[NAME]": filename},
             timeout=30,
         )
-        print(f"[disk] step1 (get uploadUrl) status={step1_resp.status_code}")
+        print(f"[disk] step1 status={step1_resp.status_code}")
         step1_result = step1_resp.json().get("result", {})
-        print(f"[disk] step1 result={safe_preview(step1_result, 300)}")
+        print(f"[disk] step1 result={safe_preview(step1_result, 200)}")
 
         upload_url = step1_result.get("uploadUrl")
         if not upload_url:
             raise Exception(f"uploadUrl не получен: {step1_result}")
 
         # Шаг 2: загружаем файл на uploadUrl
-        print(f"[disk] step2: uploading to uploadUrl...")
+        print(f"[disk] step2: uploading file...")
         step2_resp = requests.post(
             upload_url,
             files={"file": (filename, content_bytes, "text/csv")},
             timeout=60,
         )
-        print(f"[disk] step2 (upload file) status={step2_resp.status_code}")
-        print(f"[disk] step2 response={safe_preview(step2_resp.text, 1000)}")
+        print(f"[disk] step2 status={step2_resp.status_code}")
+        print(f"[disk] step2 response={safe_preview(step2_resp.text, 500)}")
 
-        # Bitrix может вернуть результат как список или как объект
         step2_data = step2_resp.json()
         file_result = step2_data
         if isinstance(step2_data, list) and step2_data:
@@ -172,17 +168,17 @@ def send_file(dialog_id, filename, content_bytes):
             or file_result.get("DETAIL_URL")
             or file_result.get("download_url")
         )
-        print(f"[disk] download_url={safe_preview(download_url, 200)}")
+        print(f"[disk] download_url={safe_preview(download_url, 150)}")
 
         if download_url:
             send_message(dialog_id, f"📎 [url={download_url}]Скачать {filename}[/url]")
-            print(f"send_file OK: {download_url[:80]}")
+            print(f"send_file OK")
             return
         else:
-            raise Exception(f"DOWNLOAD_URL не найден в ответе: {safe_preview(file_result, 300)}")
+            raise Exception(f"DOWNLOAD_URL не найден: {safe_preview(file_result, 300)}")
 
     except Exception as e:
-        print(f"[disk] send_file upload error: {e}")
+        print(f"[disk] send_file error: {e}")
 
     # ── Вариант 2: im.disk.file.commit через основной вебхук ─────────────────
     try:
@@ -193,7 +189,6 @@ def send_file(dialog_id, filename, content_bytes):
             timeout=60,
         )
         print(f"[main] im.disk.file.commit status={resp.status_code}")
-        print(f"[main] im.disk.file.commit response={safe_preview(resp.text, 500)}")
         result = resp.json()
         if resp.status_code == 200 and "error" not in result:
             print("send_file OK via im.disk.file.commit")
@@ -358,8 +353,8 @@ def extract_transactions(pdf_bytes):
     )
 
     with client.messages.stream(
-        model="claude-opus-4-6",
-        max_tokens=32000,
+        model="claude-sonnet-4-6",
+        max_tokens=16000,
         system=system_prompt,
         messages=[{
             "role": "user",
@@ -414,13 +409,18 @@ def process_pdf_async(dialog_id, file_id, fallback_url):
         total_in  = sum(float(t.get("amount", 0) or 0) for t in transactions if t.get("type") == "in")
         total_out = sum(float(t.get("amount", 0) or 0) for t in transactions if t.get("type") == "out")
         csv_bytes = to_csv(transactions)
+
+        # Уникальное имя файла с датой и временем — чтобы избежать конфликта имён на диске
+        timestamp = datetime.now().strftime("%d%m%Y_%H%M%S")
+        filename = f"ДДС_выписка_{timestamp}.csv"
+
         send_message(
             dialog_id,
             f"✅ Готово! Найдено {len(transactions)} транзакций.\n"
             f"📈 Поступления: {total_in:,.2f} ₽\n"
             f"📉 Списания: {total_out:,.2f} ₽",
         )
-        send_file(dialog_id, "ДДС_выписка.csv", csv_bytes)
+        send_file(dialog_id, filename, csv_bytes)
     except Exception as e:
         print(f"process_pdf_async ERROR: {e}")
         send_message(dialog_id, f"❌ Ошибка: {str(e)}")
