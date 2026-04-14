@@ -369,6 +369,25 @@ def save_new_rules(service, new_rules):
         print(f"save_new_rules error: {e}")
 
 
+def get_existing_auth_codes(service):
+    """Загружает все существующие коды авторизации из таблицы."""
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range="Транзакции!E:E"
+        ).execute()
+        rows = result.get("values", [])
+        # Собираем все непустые коды (пропускаем заголовок)
+        codes = set()
+        for row in rows[1:]:
+            if row and row[0] and str(row[0]).strip():
+                codes.add(str(row[0]).strip())
+        print(f"Существующих кодов авторизации: {len(codes)}")
+        return codes
+    except Exception as e:
+        print(f"get_existing_auth_codes error: {e}")
+        return set()
+
+
 def write_to_sheets(transactions):
     """Записывает транзакции в Google Sheets."""
     service = get_sheets_service()
@@ -377,9 +396,13 @@ def write_to_sheets(transactions):
     # Загружаем существующие правила из таблицы
     sheet_rules = get_existing_rules(service)
 
+    # Загружаем существующие коды авторизации (защита от дублей)
+    existing_auth_codes = get_existing_auth_codes(service)
+
     rows = []
     clarify_list = []
     new_rules = {}  # новые правила которые нужно сохранить
+    skipped = 0  # счётчик пропущенных дублей
 
     for t in transactions:
         amount = float(t.get("amount", 0) or 0)
@@ -387,6 +410,12 @@ def write_to_sheets(transactions):
         counterparty = t.get("counterparty", "")
         description = t.get("description", "")
         counterparty_upper = counterparty.upper().strip()
+        auth_code = str(t.get("auth_code", "") or "").strip()
+
+        # Проверяем дубль по коду авторизации
+        if auth_code and auth_code in existing_auth_codes:
+            skipped += 1
+            continue
 
         # Сначала смотрим правила из таблицы (точное совпадение контрагента)
         if counterparty_upper in sheet_rules:
@@ -454,8 +483,8 @@ def write_to_sheets(transactions):
     # Сохраняем новые правила
     save_new_rules(service, new_rules)
 
-    print(f"✅ Записано {len(rows)} строк, новых правил: {len(new_rules)}")
-    return clarify_list
+    print(f"✅ Записано {len(rows)} строк, пропущено дублей: {skipped}, новых правил: {len(new_rules)}")
+    return clarify_list, skipped
 
 
 # ─────────────────────────────────────────────
@@ -673,14 +702,17 @@ def process_pdf_async(dialog_id, file_id, fallback_url):
         total_out = sum(float(t.get("amount", 0) or 0) for t in transactions if t.get("type") == "out")
 
         send_message(dialog_id, "📊 Записываю в таблицу...")
-        clarify_list = write_to_sheets(transactions)
+        clarify_list, skipped = write_to_sheets(transactions)
 
+        skipped_text = f"\n⚠️ Пропущено дублей: {skipped}" if skipped > 0 else ""
         # Основное сообщение
         send_message(
             dialog_id,
             f"✅ Готово! Найдено {len(transactions)} транзакций.\n"
             f"📈 Поступления: {total_in:,.2f} ₽\n"
-            f"📉 Списания: {total_out:,.2f} ₽\n\n"
+            f"📉 Списания: {total_out:,.2f} ₽"
+
+            f"{skipped_text}\n\n"
             f"🔗 [url={SHEET_URL}]Открыть таблицу Расходы Сбер[/url]"
         )
 
