@@ -107,19 +107,49 @@ def send_file(dialog_id, filename, content_bytes):
         return
     try:
         encoded = base64.b64encode(content_bytes).decode()
+        # Сначала загружаем файл на disk через disk-вебхук
+        upload_url = f"{BITRIX_DISK_WEBHOOK_URL}/disk.folder.uploadfile.json"
+        # Получаем корневую папку пользователя
+        storage_resp = requests.get(
+            f"{BITRIX_DISK_WEBHOOK_URL}/disk.storage.getlist.json",
+            timeout=20
+        )
+        print(f"storage getlist status={storage_resp.status_code}")
+        print(f"storage getlist response={safe_preview(storage_resp.text, 2000)}")
+
+        # Пробуем im.disk.file.commit через основной вебхук
         resp = bitrix_post(
             "im.disk.file.commit",
-            {"DIALOG_ID": dialog_id, "FILE_NAME": filename, "FILE_CONTENT": encoded},
+            {"DIALOG_ID": dialog_id, "FILE_NAME": filename,
+             "FILE_CONTENT": encoded, "CLIENT_ID": BOT_CLIENT_ID},
             timeout=60,
         )
-        if resp.status_code != 200:
-            raise ValueError(f"HTTP {resp.status_code}")
-        result = resp.json()
-        if "error" in result:
-            raise ValueError(result.get("error_description") or result.get("error"))
+        if resp.status_code == 200:
+            result = resp.json()
+            if "error" not in result:
+                print("send_file: im.disk.file.commit success")
+                return
+            print(f"send_file im.disk.file.commit error: {result}")
+
+        # Запасной: загружаем через multipart и отправляем как ссылку
+        raise ValueError(f"im.disk.file.commit HTTP {resp.status_code}")
+
     except Exception as e:
         print(f"send_file error: {e}")
-        send_message(dialog_id, f"⚠️ Не удалось отправить файл: {e}")
+        # Отправляем CSV текстом в сообщении (первые 50 строк)
+        try:
+            csv_text = content_bytes.decode("utf-8-sig")
+            lines = csv_text.strip().split("\n")
+            preview = "\n".join(lines[:51])
+            if len(lines) > 51:
+                preview += f"\n... и ещё {len(lines)-51} строк"
+            send_message(
+                dialog_id,
+                f"📊 CSV-данные (скопируйте в Блокнот → сохраните как .csv):\n\n{preview}"
+            )
+        except Exception as e2:
+            print(f"send_file fallback error: {e2}")
+            send_message(dialog_id, f"⚠️ Файл готов, но не удалось отправить: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -204,36 +234,56 @@ def try_download(url, extra_headers=None):
 
 
 def get_pdf_bytes(file_id, fallback_url=None):
-    # Вариант 1: disk.file.get → DOWNLOAD_URL с токеном
+    # Вариант 1: disk.file.get через основной вебхук (im+disk+imbot)
     try:
-        disk_info = get_disk_file_info(file_id)
-        print("===== DISK FILE INFO =====")
-        print(safe_preview(disk_info, 5000))
-        download_url = extract_download_url(disk_info)
-        if download_url:
-            print(f"DOWNLOAD URL FROM DISK: {safe_preview(download_url, 500)}")
-            result = try_download(download_url)
-            if result:
-                return result
+        url = f"{BITRIX_WEBHOOK_URL}/disk.file.get.json"
+        response = requests.get(url, params={"id": file_id}, timeout=20)
+        print(f"disk.file.get via main webhook status={response.status_code}")
+        if response.status_code == 200:
+            payload = response.json()
+            if "result" in payload and payload["result"]:
+                download_url = extract_download_url(payload["result"])
+                if download_url:
+                    print(f"DOWNLOAD URL: {safe_preview(download_url, 300)}")
+                    result = try_download(download_url)
+                    if result:
+                        return result
     except Exception as e:
-        print(f"disk.file.get failed: {e}")
+        print(f"disk.file.get via main webhook failed: {e}")
 
-    # Вариант 2: fallback_url с Bearer-токеном disk-вебхука
+    # Вариант 2: disk.file.get через disk-вебхук
+    try:
+        url = f"{BITRIX_DISK_WEBHOOK_URL}/disk.file.get.json"
+        response = requests.get(url, params={"id": file_id}, timeout=20)
+        print(f"disk.file.get via disk webhook status={response.status_code}")
+        if response.status_code == 200:
+            payload = response.json()
+            if "result" in payload and payload["result"]:
+                download_url = extract_download_url(payload["result"])
+                if download_url:
+                    result = try_download(download_url)
+                    if result:
+                        return result
+    except Exception as e:
+        print(f"disk.file.get via disk webhook failed: {e}")
+
+    # Вариант 3: fallback_url с Bearer токеном основного вебхука
     if fallback_url:
-        print(f"Trying fallback_url with Bearer token...")
+        main_token = BITRIX_WEBHOOK_URL.rstrip("/").split("/")[-1]
+        print(f"Trying fallback_url with main webhook Bearer token...")
+        result = try_download(fallback_url, {"Authorization": f"Bearer {main_token}"})
+        if result:
+            return result
+
+        # Вариант 4: fallback_url с Bearer токеном disk-вебхука
+        print(f"Trying fallback_url with disk webhook Bearer token...")
         result = try_download(fallback_url, {"Authorization": f"Bearer {DISK_TOKEN}"})
         if result:
             return result
 
-        # Вариант 3: fallback_url без авторизации (вдруг открытый)
-        print("Trying fallback_url without auth...")
-        result = try_download(fallback_url)
-        if result:
-            return result
-
     raise ValueError(
-        "Не удалось скачать PDF.\n"
-        "Добавьте скоуп 'Чат и уведомления (im)' к вебхуку 9pkspu2vkwp1zkrs в Bitrix24."
+        "Не удалось скачать PDF. "
+        "Проверьте логи — нужно посмотреть какой статус возвращает disk.file.get."
     )
 
 
