@@ -288,19 +288,36 @@ def init_sheets():
             body={"requests": requests_body}
         ).execute()
 
-    # Заголовки Транзакции
+    # Заголовки Транзакции — вставляем принудительно в строку 1
+    headers = [["Дата загрузки", "Дата операции", "Контрагент",
+                "Описание", "Приход", "Расход", "Категория",
+                "Личное/Бизнес", "Статус"]]
+
+    # Проверяем первую строку
     result = service.spreadsheets().values().get(
-        spreadsheetId=SHEET_ID, range="Транзакции!A1"
+        spreadsheetId=SHEET_ID, range="Транзакции!A1:I1"
     ).execute()
-    if not result.get("values"):
+    first_row = result.get("values", [[]])[0] if result.get("values") else []
+
+    if first_row != headers[0]:
+        # Вставляем новую строку сверху
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=SHEET_ID,
+            body={"requests": [{"insertDimension": {
+                "range": {"sheetId": 0, "dimension": "ROWS", "startIndex": 0, "endIndex": 1},
+                "inheritFromBefore": False
+            }}]}
+        ).execute()
+        # Пишем заголовки
         service.spreadsheets().values().update(
             spreadsheetId=SHEET_ID,
             range="Транзакции!A1",
             valueInputOption="RAW",
-            body={"values": [["Дата загрузки", "Дата операции", "Контрагент",
-                              "Описание", "Приход", "Расход", "Категория",
-                              "Личное/Бизнес", "Статус"]]}
+            body={"values": headers}
         ).execute()
+        print("Заголовки добавлены")
+    else:
+        print("Заголовки уже есть")
 
     # Заполняем правила
     rules_rows = [["Ключевое слово", "Категория", "Личное/Бизнес"]]
@@ -317,21 +334,70 @@ def init_sheets():
     print(f"✅ Таблица инициализирована, правил: {len(BUILTIN_RULES)}")
 
 
+def get_existing_rules(service):
+    """Загружает существующие правила из таблицы."""
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range="Правила!A:C"
+        ).execute()
+        rows = result.get("values", [])
+        # Словарь: контрагент (upper) -> (категория, тип)
+        rules = {}
+        for row in rows[1:]:  # пропускаем заголовок
+            if len(row) >= 2 and row[0]:
+                rules[row[0].upper().strip()] = (
+                    row[1] if len(row) > 1 else "",
+                    row[2] if len(row) > 2 else ""
+                )
+        return rules
+    except Exception as e:
+        print(f"get_existing_rules error: {e}")
+        return {}
+
+
+def save_new_rules(service, new_rules):
+    """Добавляет новые правила в таблицу (только те которых ещё нет)."""
+    if not new_rules:
+        return
+    try:
+        rows = [[k, v[0], v[1]] for k, v in new_rules.items()]
+        service.spreadsheets().values().append(
+            spreadsheetId=SHEET_ID,
+            range="Правила!A:C",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": rows},
+        ).execute()
+        print(f"✅ Добавлено новых правил: {len(rows)}")
+    except Exception as e:
+        print(f"save_new_rules error: {e}")
+
+
 def write_to_sheets(transactions):
     """Записывает транзакции в Google Sheets."""
     service = get_sheets_service()
     upload_date = datetime.now().strftime("%d.%m.%Y %H:%M")
+
+    # Загружаем существующие правила из таблицы
+    sheet_rules = get_existing_rules(service)
+
     rows = []
     clarify_list = []
+    new_rules = {}  # новые правила которые нужно сохранить
 
     for t in transactions:
         amount = float(t.get("amount", 0) or 0)
         t_type = t.get("type", "out")
         counterparty = t.get("counterparty", "")
         description = t.get("description", "")
+        counterparty_upper = counterparty.upper().strip()
 
-        # Применяем правила
-        category, biz_type = apply_rules(counterparty, description, amount, t_type)
+        # Сначала смотрим правила из таблицы (точное совпадение контрагента)
+        if counterparty_upper in sheet_rules:
+            category, biz_type = sheet_rules[counterparty_upper]
+        else:
+            # Потом встроенные правила
+            category, biz_type = apply_rules(counterparty, description, amount, t_type)
 
         inc = f"{amount:,.2f}".replace(".", ",") if t_type == "in" else ""
         exp = f"{amount:,.2f}".replace(".", ",") if t_type == "out" else ""
@@ -345,6 +411,13 @@ def write_to_sheets(transactions):
                 "type": "Поступление" if t_type == "in" else "Списание",
                 "description": description,
             })
+            # Записываем в новые правила с пустой категорией — чтобы Алан заполнил
+            if counterparty_upper not in sheet_rules and counterparty not in new_rules:
+                new_rules[counterparty] = ("❓ Уточнить", "")
+        else:
+            # Если правило было применено из BUILTIN — сохраняем точный контрагент
+            if counterparty_upper not in sheet_rules and counterparty not in new_rules:
+                new_rules[counterparty] = (category, biz_type)
 
         rows.append([
             upload_date,
@@ -358,6 +431,7 @@ def write_to_sheets(transactions):
             status,
         ])
 
+    # Записываем транзакции
     service.spreadsheets().values().append(
         spreadsheetId=SHEET_ID,
         range="Транзакции!A:I",
@@ -366,7 +440,10 @@ def write_to_sheets(transactions):
         body={"values": rows},
     ).execute()
 
-    print(f"✅ Записано {len(rows)} строк")
+    # Сохраняем новые правила
+    save_new_rules(service, new_rules)
+
+    print(f"✅ Записано {len(rows)} строк, новых правил: {len(new_rules)}")
     return clarify_list
 
 
