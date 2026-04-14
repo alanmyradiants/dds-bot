@@ -328,7 +328,7 @@ def extract_transactions(pdf_bytes):
         "type: in=поступление, out=списание. amount всегда положительное."
     )
 
-    msg = client.messages.create(
+    with client.messages.stream(
         model="claude-opus-4-6",
         max_tokens=32000,
         system=system_prompt,
@@ -339,9 +339,8 @@ def extract_transactions(pdf_bytes):
                 {"type": "text", "text": "Извлеки все транзакции."},
             ],
         }],
-    )
-
-    text = msg.content[0].text
+    ) as stream:
+        text = stream.get_final_text()
     print(f"Claude FULL response: {safe_preview(text, 5000)}")
 
     start = text.find("[")
