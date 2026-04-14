@@ -388,8 +388,8 @@ def to_csv(transactions):
     writer.writerow(["Дата", "Контрагент", "Описание", "Приход", "Расход", "Статья ДДС"])
     for t in transactions:
         amount = float(t.get("amount", 0) or 0)
-        inc = f"{amount:.2f}" if t.get("type") == "in" else ""
-        exp = f"{amount:.2f}" if t.get("type") == "out" else ""
+        inc = f"{amount:.2f}".replace(".", ",") if t.get("type") == "in" else ""
+        exp = f"{amount:.2f}".replace(".", ",") if t.get("type") == "out" else ""
         writer.writerow([
             t.get("date", ""), t.get("counterparty", ""),
             t.get("description", ""), inc, exp, t.get("category", ""),
