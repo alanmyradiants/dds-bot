@@ -477,8 +477,8 @@ def write_to_sheets(transactions):
             description,
             inc,
             exp,
-            "=IFERROR(VLOOKUP(G" + str(current_row) + ",'Правила'!$A:$B,2,0),\"? Уточнить\")",
-            "=IFERROR(VLOOKUP(G" + str(current_row) + ",'Правила'!$A:$C,3,0),\"\")",
+            "=IFERROR(VLOOKUP(G" + str(current_row) + ";'Правила'!$A:$B;2;0);\"? Уточнить\")",
+            "=IFERROR(VLOOKUP(G" + str(current_row) + ";'Правила'!$A:$C;3;0);\"\")",
             status,
         ])
         current_row += 1
