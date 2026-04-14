@@ -685,18 +685,32 @@ def extract_transactions(pdf_bytes):
     print(f"Claude response: {safe_preview(text, 500)}")
 
     start = text.find("[")
-    end = text.rfind("]")
-    if start == -1 or end == -1 or end < start:
+    if start == -1:
         raise ValueError(f"Транзакции не найдены. Ответ: {safe_preview(text, 300)}")
 
-    json_str = text[start:end + 1]
+    end = text.rfind("]")
+
+    # Если ] не найден — JSON обрезан, восстанавливаем
+    if end == -1 or end < start:
+        print("JSON обрезан — восстанавливаем по последнему }")
+        last_close = text.rfind("}")
+        if last_close == -1:
+            raise ValueError("Не удалось найти транзакции в ответе")
+        json_str = text[start:last_close + 1] + "]"
+    else:
+        json_str = text[start:end + 1]
+
     try:
         return json.loads(json_str)
     except json.JSONDecodeError:
+        # Ещё раз пробуем восстановить по последнему }
         last_close = json_str.rfind("}")
         if last_close == -1:
             raise ValueError("Не удалось распарсить ответ ИИ")
-        return json.loads(json_str[:last_close + 1] + "]")
+        try:
+            return json.loads(json_str[:last_close + 1] + "]")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Ошибка парсинга JSON: {e}")
 
 
 # ─────────────────────────────────────────────
