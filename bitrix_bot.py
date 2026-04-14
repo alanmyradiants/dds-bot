@@ -130,7 +130,6 @@ def send_file(dialog_id, filename, content_bytes):
 
     # Вариант 2: загрузка через multipart на диск + ссылка
     try:
-        # Получаем хранилища через основной вебхук
         storage_resp = requests.get(
             f"{BITRIX_WEBHOOK_URL}/disk.storage.getlist.json",
             timeout=20
@@ -145,7 +144,6 @@ def send_file(dialog_id, filename, content_bytes):
             root_folder_id = user_storage.get("ROOT_OBJECT_ID") or user_storage.get("ID")
             print(f"Root folder ID: {root_folder_id}")
 
-            # Загружаем через multipart/form-data
             upload_resp = requests.post(
                 f"{BITRIX_WEBHOOK_URL}/disk.folder.uploadfile.json",
                 data={"id": root_folder_id, "data[NAME]": filename},
@@ -209,22 +207,6 @@ def find_pdf_in_payload(data):
     return result
 
 
-def get_disk_file_info(file_id):
-    url = f"{BITRIX_DISK_WEBHOOK_URL}/disk.file.get.json"
-    response = requests.get(url, params={"id": file_id}, timeout=20)
-    print(f"disk.file.get GET status={response.status_code}")
-    print(f"disk.file.get GET response={safe_preview(response.text, 4000)}")
-    if response.status_code != 200:
-        raise ValueError(f"disk.file.get вернул HTTP {response.status_code}")
-    payload = response.json()
-    if "error" in payload:
-        raise ValueError(payload.get("error_description") or payload.get("error"))
-    result = payload.get("result", {})
-    if not result:
-        raise ValueError("disk.file.get вернул пустой result")
-    return result
-
-
 def extract_download_url(file_info):
     for key in ["DOWNLOAD_URL", "downloadUrl", "DOWNLOAD_URL_MACHINE", "URL_DOWNLOAD"]:
         value = file_info.get(key)
@@ -234,25 +216,57 @@ def extract_download_url(file_info):
 
 
 def try_download(url, extra_headers=None):
-    """Попытка скачать PDF по URL."""
+    """
+    Скачивает файл по URL.
+    Принимает: application/pdf, application/octet-stream, или байты начинающиеся с %PDF.
+    Отвергает только явный HTML (вероятно, страница логина).
+    """
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/pdf,application/octet-stream,*/*",
     }
     if extra_headers:
         headers.update(extra_headers)
+
     resp = requests.get(url, headers=headers, timeout=60, allow_redirects=True)
     content_type = (resp.headers.get("Content-Type") or "").lower()
-    print(f"try_download status={resp.status_code} content_type={content_type} first={resp.content[:20]}")
-    if resp.status_code == 200 and (
-        "application/pdf" in content_type or resp.content.startswith(b"%PDF")
-    ):
+    first_bytes = resp.content[:20] if resp.content else b""
+    content_len = len(resp.content)
+
+    print(f"try_download status={resp.status_code} "
+          f"content_type={content_type} "
+          f"size={content_len} "
+          f"first={first_bytes}")
+
+    if resp.status_code != 200:
+        print(f"try_download FAIL: non-200 status")
+        return None
+
+    # Явный HTML — скорее всего редирект на страницу логина
+    if "text/html" in content_type:
+        print(f"try_download FAIL: got HTML (login page?), body={safe_preview(resp.text, 300)}")
+        return None
+
+    # Принимаем PDF, octet-stream, или любой файл начинающийся с %PDF
+    is_pdf_content_type = "application/pdf" in content_type
+    is_octet_stream     = "application/octet-stream" in content_type
+    is_pdf_magic        = first_bytes.startswith(b"%PDF")
+
+    if is_pdf_content_type or is_octet_stream or is_pdf_magic:
+        print(f"try_download OK: got {content_len} bytes")
         return resp.content
+
+    # Неизвестный тип — принимаем если размер разумный (>1KB) и не HTML
+    if content_len > 1024:
+        print(f"try_download OK (unknown type, size OK): {content_type}, {content_len} bytes")
+        return resp.content
+
+    print(f"try_download FAIL: unrecognized content_type={content_type}, size={content_len}")
     return None
 
 
 def get_pdf_bytes(file_id, fallback_url=None):
-    # Вариант 1: disk.file.get через основной вебхук (im+disk+imbot)
+    # Вариант 1: disk.file.get через основной вебхук
     try:
         url = f"{BITRIX_WEBHOOK_URL}/disk.file.get.json"
         response = requests.get(url, params={"id": file_id}, timeout=20)
@@ -262,7 +276,7 @@ def get_pdf_bytes(file_id, fallback_url=None):
             if "result" in payload and payload["result"]:
                 download_url = extract_download_url(payload["result"])
                 if download_url:
-                    print(f"DOWNLOAD URL: {safe_preview(download_url, 300)}")
+                    print(f"Variant 1 DOWNLOAD_URL: {safe_preview(download_url, 200)}")
                     result = try_download(download_url)
                     if result:
                         return result
@@ -279,27 +293,27 @@ def get_pdf_bytes(file_id, fallback_url=None):
             print(f"disk.file.get result keys: {list(payload.get('result', {}).keys())}")
             if "result" in payload and payload["result"]:
                 download_url = extract_download_url(payload["result"])
-                print(f"extracted download_url: {safe_preview(download_url, 300)}")
+                print(f"Variant 2 extracted download_url: {safe_preview(download_url, 200)}")
                 if download_url:
                     result = try_download(download_url)
                     if result:
                         return result
-                    print("try_download returned None — PDF check failed")
+                    print("Variant 2 try_download returned None")
                 else:
-                    print(f"extract_download_url returned None. Full result: {safe_preview(payload['result'], 1000)}")
+                    print(f"Variant 2: extract_download_url=None. Full result: {safe_preview(payload['result'], 1000)}")
     except Exception as e:
         print(f"disk.file.get via disk webhook failed: {e}")
 
     # Вариант 3: fallback_url с Bearer токеном основного вебхука
     if fallback_url:
         main_token = BITRIX_WEBHOOK_URL.rstrip("/").split("/")[-1]
-        print(f"Trying fallback_url with main webhook Bearer token...")
+        print(f"Variant 3: fallback_url with main Bearer token")
         result = try_download(fallback_url, {"Authorization": f"Bearer {main_token}"})
         if result:
             return result
 
         # Вариант 4: fallback_url с Bearer токеном disk-вебхука
-        print(f"Trying fallback_url with disk webhook Bearer token...")
+        print(f"Variant 4: fallback_url with disk Bearer token")
         result = try_download(fallback_url, {"Authorization": f"Bearer {DISK_TOKEN}"})
         if result:
             return result
@@ -430,8 +444,8 @@ def bot_handler():
     print("===== FOUND FILE INFO =====")
     print(safe_preview(file_info, 4000))
 
-    file_id    = file_info.get("file_id")
-    filename   = file_info.get("filename") or ""
+    file_id      = file_info.get("file_id")
+    filename     = file_info.get("filename") or ""
     fallback_url = file_info.get("url_download")
 
     if filename.lower().endswith(".pdf") and file_id:
