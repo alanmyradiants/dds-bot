@@ -273,12 +273,17 @@ def get_pdf_bytes(file_id, fallback_url=None):
         print(f"disk.file.get via disk webhook status={response.status_code}")
         if response.status_code == 200:
             payload = response.json()
+            print(f"disk.file.get result keys: {list(payload.get('result', {}).keys())}")
             if "result" in payload and payload["result"]:
                 download_url = extract_download_url(payload["result"])
+                print(f"extracted download_url: {safe_preview(download_url, 300)}")
                 if download_url:
                     result = try_download(download_url)
                     if result:
                         return result
+                    print("try_download returned None — PDF check failed")
+                else:
+                    print(f"extract_download_url returned None. Full result: {safe_preview(payload['result'], 1000)}")
     except Exception as e:
         print(f"disk.file.get via disk webhook failed: {e}")
 
