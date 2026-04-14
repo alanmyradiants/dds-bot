@@ -26,19 +26,7 @@ SHEET_URL  = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 # ─────────────────────────────────────────────
 # Google Sheets credentials
 # ─────────────────────────────────────────────
-GOOGLE_CREDS_JSON = {
-    "type": "service_account",
-    "project_id": "joto-taskbot",
-    "private_key_id": "7718e5c0c0210cfbed4265e512d983e37f0a2e93",
-    "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDH3Gq5Mcq4DcJ5\nv6nRiB5752w+TObS99J/R5/wqfVEcZG7EAe744UY8lVnl0SoqziYR+Dd/N3QMASh\n5BrXkw5VZMQjutCJ14pPx6qMdeASqMggdrTRY6bam4YgpNrUbjL0+LqOS/6Z3P+5\nMPcPapmalTqIAD4OZt4hZesLHpKvHAsDlMDpsJFHqOdSgkTjuZfkAVHoWCmWGaHK\n4WZPVaL86zmxgqGSr24XGlw6FEzZD0HJuSpkVFP/B/XSUdVa1fqn82GbTgU87Vpz\nEGZicpcLPAxpj8WJbLaIZf//5Ycd6NxYB4C0lVVkSDLCboY976y1j1nUcxp0t9EE\nWL4+L99hAgMBAAECgf9iu+m+o10fHRrHFScogMLNOcqYfxwQ6LCcmN/dlwk69dBm\ns2qB9LqNVINFDRJ66CXEOalK3MrMsIOjyjZJeEzwDIlrZnE2zCUaVEqjwH29n/ew\n4vPUPs8kqC2/auCwZNqI8WdNGSPC/pRmRqr16Es9ztkWVt6Fl69JlxUorQbEyLhG\ne6xZ7P147225ajveQtwloZJ9YlGVDDuzEHLQ20jXcxaeUlWIdWRzBignXVoouTcN\nHUC4IYEKFFm9J8VGShPtzfoIhDjTFusLU570laM2d5KT4kLwakxMhrZbyLDPtvBx\n/xHaPGU5qRIODKeocWXaFhCUAherBszsuatSFxUCgYEA9A/yq6791fE7hPy49hcn\ncK4Y9UvYy2SZ6Gk5v8Hb6wtsVAwzdwIV5Fvl5/If68qrHEdHH43sAkrfMlbg0uXn\nLhGfGgerPyZywuhwf6q8tjCPLfeyWKPIdrxo1jCo03cMluJ1xj40DjJLmdtqIgOZ\nGJVSUIGcdWDNxFUD2BPEN3cCgYEA0aL/bKWNsAnymouZjiIIBlPa4nW2iHsTCd6t\nbHcWXt6eOmaYtkgGK3t815pYhiAgGEAjBRoU/6W3ps8FWzraYXttIgX51cGd2tAm\nbKcu/3ZeXAUpmMFSwnYr3Mri6uBpWuf2w3wfgYrGAYoS8RwmF1mr4B1GzuDSAjVE\n/Yl3hecCgYAAqqZ8B49T7UO/Wj1bFrcZ3K/ew6VE8PJmqxroRixGmRJjrGDbm1rZ\n89JN7uBdcYFEI4GzOV0CqJexeIFGsjAOdSfdF1ZFZuJ7W80q3BmF2d4aPwnyqgfb\nIyqaIyni4flb1CSENRlJTKPeOLYyf5YEdivyYlg+DdSiC6VmCq/HgwKBgQCLb9Zj\nJq7ag5NZVjdZwasCwm3ZqSAzIWGlc/Z4KbG4gmxOPgWfYMKx015Tbfcpp16Ror9o\nWlPTQx+nlRVj+/5bTqRlOAJYOoNLkp2sMXtiMhJLNKfZUeVBMSa1okFSpteMvrN0\njS/Lk0lmprc4pldzupJG7FI3snQdQd9UoEXeywKBgQCSwDuVtZQ9XW5/IP0en6Cy\nj4A+cnHVecdkISHSkN9WQNqhrqFcGij2gn3+YQzJp0gF8962N9pSevqegumtsbbu\nrxyratoJlmAnESwWMPfe2MQePvv/YW9vFgw0Y7zhYv4E3CaVe4xWQZzFHv4gkkd+\nTQZx7sKSdtu3leIKWL1SEw==\n-----END PRIVATE KEY-----\n",
-    "client_email": "taskbot@joto-taskbot.iam.gserviceaccount.com",
-    "client_id": "109280707972066163791",
-    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-    "token_uri": "https://oauth2.googleapis.com/token",
-    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-    "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/taskbot%40joto-taskbot.iam.gserviceaccount.com",
-    "universe_domain": "googleapis.com"
-}
+GOOGLE_CREDS_JSON = json.loads(os.environ.get('GOOGLE_CREDENTIALS'))
 
 # ─────────────────────────────────────────────
 # Категории и правила
