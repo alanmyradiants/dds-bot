@@ -454,8 +454,11 @@ def try_download(url, extra_headers=None):
 
 
 def get_pdf_bytes(file_id, fallback_url=None):
+    import time
+
+    # Вариант 1: основной вебхук
     try:
-        response = requests.get(f"{BITRIX_WEBHOOK_URL}/disk.file.get.json", params={"id": file_id}, timeout=20)
+        response = requests.get(f"{BITRIX_WEBHOOK_URL}/disk.file.get.json", params={"id": file_id}, timeout=30)
         print(f"disk.file.get via main webhook status={response.status_code}")
         if response.status_code == 200:
             payload = response.json()
@@ -468,20 +471,31 @@ def get_pdf_bytes(file_id, fallback_url=None):
     except Exception as e:
         print(f"main webhook failed: {e}")
 
-    try:
-        response = requests.get(f"{BITRIX_DISK_WEBHOOK_URL}/disk.file.get.json", params={"id": file_id}, timeout=20)
-        print(f"disk.file.get via disk webhook status={response.status_code}")
-        if response.status_code == 200:
-            payload = response.json()
-            if payload.get("result"):
-                dl = extract_download_url(payload["result"])
-                if dl:
-                    result = try_download(dl)
-                    if result:
-                        return result
-    except Exception as e:
-        print(f"disk webhook failed: {e}")
+    # Вариант 2: disk-вебхук (3 попытки с паузой)
+    for attempt in range(3):
+        try:
+            print(f"disk webhook attempt {attempt + 1}/3")
+            response = requests.get(
+                f"{BITRIX_DISK_WEBHOOK_URL}/disk.file.get.json",
+                params={"id": file_id},
+                timeout=45,
+            )
+            print(f"disk webhook status={response.status_code}")
+            if response.status_code == 200:
+                payload = response.json()
+                if payload.get("result"):
+                    dl = extract_download_url(payload["result"])
+                    if dl:
+                        result = try_download(dl)
+                        if result:
+                            return result
+            break
+        except Exception as e:
+            print(f"disk webhook attempt {attempt + 1} failed: {e}")
+            if attempt < 2:
+                time.sleep(5)
 
+    # Вариант 3 & 4: fallback_url
     if fallback_url:
         for label, token in [("main", BITRIX_WEBHOOK_URL.rstrip("/").split("/")[-1]), ("disk", DISK_TOKEN)]:
             print(f"Trying fallback_url with {label} Bearer token")
