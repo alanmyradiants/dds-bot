@@ -105,51 +105,66 @@ def send_file(dialog_id, filename, content_bytes):
     if not dialog_id:
         print("send_file skipped: no dialog_id")
         return
+
+    encoded = base64.b64encode(content_bytes).decode()
+
+    # Шаг 1: находим корневую папку пользователя на Диске
     try:
-        encoded = base64.b64encode(content_bytes).decode()
-        # Сначала загружаем файл на disk через disk-вебхук
-        upload_url = f"{BITRIX_DISK_WEBHOOK_URL}/disk.folder.uploadfile.json"
-        # Получаем корневую папку пользователя
         storage_resp = requests.get(
-            f"{BITRIX_DISK_WEBHOOK_URL}/disk.storage.getlist.json",
+            f"{BITRIX_WEBHOOK_URL}/disk.storage.getlist.json",
             timeout=20
         )
-        print(f"storage getlist status={storage_resp.status_code}")
-        print(f"storage getlist response={safe_preview(storage_resp.text, 2000)}")
+        print(f"storage.getlist status={storage_resp.status_code}")
+        storages = storage_resp.json().get("result", [])
+        # Берём личное хранилище пользователя (type=1)
+        user_storage = next((s for s in storages if s.get("TYPE") == "1"), None)
+        if not user_storage:
+            user_storage = storages[0] if storages else None
 
-        # Пробуем im.disk.file.commit через основной вебхук
-        resp = bitrix_post(
-            "im.disk.file.commit",
-            {"DIALOG_ID": dialog_id, "FILE_NAME": filename,
-             "FILE_CONTENT": encoded, "CLIENT_ID": BOT_CLIENT_ID},
-            timeout=60,
-        )
-        if resp.status_code == 200:
-            result = resp.json()
-            if "error" not in result:
-                print("send_file: im.disk.file.commit success")
+        if user_storage:
+            root_folder_id = user_storage.get("ROOT_OBJECT_ID") or user_storage.get("ID")
+            print(f"Root folder ID: {root_folder_id}")
+
+            # Шаг 2: загружаем файл в корневую папку
+            upload_resp = requests.post(
+                f"{BITRIX_WEBHOOK_URL}/disk.folder.uploadfile.json",
+                json={
+                    "id": root_folder_id,
+                    "fileContent": [filename, encoded],
+                    "data": {"NAME": filename},
+                },
+                timeout=60,
+            )
+            print(f"uploadfile status={upload_resp.status_code}")
+            print(f"uploadfile response={safe_preview(upload_resp.text, 2000)}")
+
+            upload_result = upload_resp.json().get("result", {})
+            download_url = upload_result.get("DOWNLOAD_URL") or upload_result.get("DETAIL_URL")
+
+            if download_url:
+                send_message(
+                    dialog_id,
+                    f"📎 Файл готов: [url={download_url}]{filename}[/url]"
+                )
                 return
-            print(f"send_file im.disk.file.commit error: {result}")
-
-        # Запасной: загружаем через multipart и отправляем как ссылку
-        raise ValueError(f"im.disk.file.commit HTTP {resp.status_code}")
 
     except Exception as e:
-        print(f"send_file error: {e}")
-        # Отправляем CSV текстом в сообщении (первые 50 строк)
-        try:
-            csv_text = content_bytes.decode("utf-8-sig")
-            lines = csv_text.strip().split("\n")
-            preview = "\n".join(lines[:51])
-            if len(lines) > 51:
-                preview += f"\n... и ещё {len(lines)-51} строк"
-            send_message(
-                dialog_id,
-                f"📊 CSV-данные (скопируйте в Блокнот → сохраните как .csv):\n\n{preview}"
-            )
-        except Exception as e2:
-            print(f"send_file fallback error: {e2}")
-            send_message(dialog_id, f"⚠️ Файл готов, но не удалось отправить: {e}")
+        print(f"send_file upload error: {e}")
+
+    # Запасной: отправляем через im.disk.file.commit
+    try:
+        resp = bitrix_post(
+            "im.disk.file.commit",
+            {"DIALOG_ID": dialog_id, "FILE_NAME": filename, "FILE_CONTENT": encoded},
+            timeout=60,
+        )
+        if resp.status_code == 200 and "error" not in resp.json():
+            print("send_file: im.disk.file.commit success")
+            return
+    except Exception as e:
+        print(f"im.disk.file.commit error: {e}")
+
+    send_message(dialog_id, f"⚠️ Не удалось отправить файл. Обратитесь к администратору.")
 
 
 # ─────────────────────────────────────────────
