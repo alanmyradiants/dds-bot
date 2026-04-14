@@ -320,7 +320,7 @@ def init_sheets():
         print("Заголовки уже есть")
 
     # Заполняем правила
-    rules_rows = [["Ключевое слово", "Категория", "Личное/Бизнес"]]
+    rules_rows = [["Контрагент", "Категория", "Личное/Бизнес"]]
     for keyword, (category, biz_type) in BUILTIN_RULES.items():
         rules_rows.append([keyword, category, biz_type])
 
