@@ -319,19 +319,15 @@ def init_sheets():
     else:
         print("Заголовки уже есть")
 
-    # Заполняем правила
-    rules_rows = [["Контрагент", "Категория", "Личное/Бизнес"]]
-    for keyword, (category, biz_type) in BUILTIN_RULES.items():
-        rules_rows.append([keyword, category, biz_type])
-
+    # Заголовок Правила — принудительно перезаписываем только заголовок
     service.spreadsheets().values().update(
         spreadsheetId=SHEET_ID,
-        range="Правила!A1",
+        range="Правила!A1:C1",
         valueInputOption="RAW",
-        body={"values": rules_rows}
+        body={"values": [["Контрагент", "Категория", "Личное/Бизнес"]]}
     ).execute()
-
-    print(f"✅ Таблица инициализирована, правил: {len(BUILTIN_RULES)}")
+    print("✅ Таблица инициализирована")
+    print("ℹ️ Правила заполнятся автоматически при загрузке PDF")
 
 
 def get_existing_rules(service):
