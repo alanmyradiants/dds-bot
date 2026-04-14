@@ -108,63 +108,60 @@ def send_file(dialog_id, filename, content_bytes):
 
     encoded = base64.b64encode(content_bytes).decode()
 
-    # Шаг 1: находим корневую папку пользователя на Диске
     try:
+        # Шаг 1: получаем список хранилищ через disk-вебхук
         storage_resp = requests.get(
-            f"{BITRIX_WEBHOOK_URL}/disk.storage.getlist.json",
+            f"{BITRIX_DISK_WEBHOOK_URL}/disk.storage.getlist.json",
             timeout=20
         )
         print(f"storage.getlist status={storage_resp.status_code}")
+        print(f"storage.getlist response={safe_preview(storage_resp.text, 1000)}")
+
         storages = storage_resp.json().get("result", [])
-        # Берём личное хранилище пользователя (type=1)
-        user_storage = next((s for s in storages if s.get("TYPE") == "1"), None)
+        # Берём личное хранилище (type=1) или первое доступное
+        user_storage = next((s for s in storages if str(s.get("TYPE")) == "1"), None)
+        if not user_storage and storages:
+            user_storage = storages[0]
+
         if not user_storage:
-            user_storage = storages[0] if storages else None
+            raise ValueError("Не найдено ни одного хранилища")
 
-        if user_storage:
-            root_folder_id = user_storage.get("ROOT_OBJECT_ID") or user_storage.get("ID")
-            print(f"Root folder ID: {root_folder_id}")
+        root_folder_id = user_storage.get("ROOT_OBJECT_ID") or user_storage.get("ID")
+        print(f"Root folder ID: {root_folder_id}")
 
-            # Шаг 2: загружаем файл в корневую папку
-            upload_resp = requests.post(
-                f"{BITRIX_WEBHOOK_URL}/disk.folder.uploadfile.json",
-                json={
-                    "id": root_folder_id,
-                    "fileContent": [filename, encoded],
-                    "data": {"NAME": filename},
-                },
-                timeout=60,
-            )
-            print(f"uploadfile status={upload_resp.status_code}")
-            print(f"uploadfile response={safe_preview(upload_resp.text, 2000)}")
-
-            upload_result = upload_resp.json().get("result", {})
-            download_url = upload_result.get("DOWNLOAD_URL") or upload_result.get("DETAIL_URL")
-
-            if download_url:
-                send_message(
-                    dialog_id,
-                    f"📎 Файл готов: [url={download_url}]{filename}[/url]"
-                )
-                return
-
-    except Exception as e:
-        print(f"send_file upload error: {e}")
-
-    # Запасной: отправляем через im.disk.file.commit
-    try:
-        resp = bitrix_post(
-            "im.disk.file.commit",
-            {"DIALOG_ID": dialog_id, "FILE_NAME": filename, "FILE_CONTENT": encoded},
+        # Шаг 2: загружаем файл в корневую папку через disk-вебхук
+        upload_resp = requests.post(
+            f"{BITRIX_DISK_WEBHOOK_URL}/disk.folder.uploadfile.json",
+            json={
+                "id": root_folder_id,
+                "fileContent": [filename, encoded],
+                "data": {"NAME": filename},
+            },
             timeout=60,
         )
-        if resp.status_code == 200 and "error" not in resp.json():
-            print("send_file: im.disk.file.commit success")
-            return
-    except Exception as e:
-        print(f"im.disk.file.commit error: {e}")
+        print(f"uploadfile status={upload_resp.status_code}")
+        print(f"uploadfile response={safe_preview(upload_resp.text, 2000)}")
 
-    send_message(dialog_id, f"⚠️ Не удалось отправить файл. Обратитесь к администратору.")
+        upload_result = upload_resp.json().get("result", {})
+        download_url = (
+            upload_result.get("DOWNLOAD_URL")
+            or upload_result.get("DETAIL_URL")
+        )
+
+        if download_url:
+            # Шаг 3: отправляем ссылку через imbot
+            send_message(
+                dialog_id,
+                f"📎 [url={download_url}]Скачать {filename}[/url]"
+            )
+            print(f"send_file: sent download link {download_url}")
+            return
+
+        raise ValueError(f"uploadfile не вернул download_url. result={safe_preview(upload_result, 500)}")
+
+    except Exception as e:
+        print(f"send_file error: {e}")
+        send_message(dialog_id, f"⚠️ Не удалось отправить файл: {e}")
 
 
 # ─────────────────────────────────────────────
