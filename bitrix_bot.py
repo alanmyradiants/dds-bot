@@ -391,7 +391,9 @@ def get_existing_auth_codes(service):
 def write_to_sheets(transactions):
     """Записывает транзакции в Google Sheets."""
     service = get_sheets_service()
-    upload_date = datetime.now().strftime("%d.%m.%Y %H:%M")
+    from datetime import timezone, timedelta
+    moscow_tz = timezone(timedelta(hours=3))
+    upload_date = datetime.now(moscow_tz).strftime("%d.%m.%Y %H:%M")
 
     # Загружаем существующие правила из таблицы
     sheet_rules = get_existing_rules(service)
@@ -403,6 +405,15 @@ def write_to_sheets(transactions):
     clarify_list = []
     new_rules = {}  # новые правила которые нужно сохранить
     skipped = 0  # счётчик пропущенных дублей
+
+    # Узнаём с какой строки начнём запись (для формул ВПР)
+    try:
+        existing = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range="Транзакции!A:A"
+        ).execute()
+        current_row = len(existing.get("values", [])) + 1
+    except Exception:
+        current_row = 2
 
     for t in transactions:
         amount = float(t.get("amount", 0) or 0)
@@ -460,22 +471,23 @@ def write_to_sheets(transactions):
             date_str,
             t.get("time", ""),
             t.get("processing_date", ""),
-            t.get("auth_code", ""),
+            auth_code,
             month_label,
             counterparty,
             description,
             inc,
             exp,
-            category,
-            biz_type,
+            f'=IFERROR(VLOOKUP(G{current_row},Правила!$A:$B,2,0),"❓ Уточнить")',
+            f'=IFERROR(VLOOKUP(G{current_row},Правила!$A:$C,3,0),"")',
             status,
         ])
+        current_row += 1
 
     # Записываем транзакции
     service.spreadsheets().values().append(
         spreadsheetId=SHEET_ID,
         range="Транзакции!A:M",
-        valueInputOption="RAW",
+        valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
         body={"values": rows},
     ).execute()
