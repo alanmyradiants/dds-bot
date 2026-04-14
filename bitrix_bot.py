@@ -108,60 +108,66 @@ def send_file(dialog_id, filename, content_bytes):
 
     encoded = base64.b64encode(content_bytes).decode()
 
+    # Вариант 1: im.disk.file.commit через основной вебхук
     try:
-        # Шаг 1: получаем список хранилищ через disk-вебхук
+        resp = requests.post(
+            f"{BITRIX_WEBHOOK_URL}/im.disk.file.commit.json",
+            json={
+                "DIALOG_ID": dialog_id,
+                "FILE_NAME": filename,
+                "FILE_CONTENT": encoded,
+            },
+            timeout=60,
+        )
+        print(f"im.disk.file.commit status={resp.status_code}")
+        print(f"im.disk.file.commit response={safe_preview(resp.text, 500)}")
+        result = resp.json()
+        if resp.status_code == 200 and "error" not in result:
+            print("send_file: im.disk.file.commit success")
+            return
+    except Exception as e:
+        print(f"im.disk.file.commit error: {e}")
+
+    # Вариант 2: загрузка через multipart на диск + ссылка
+    try:
+        # Получаем хранилища через основной вебхук
         storage_resp = requests.get(
-            f"{BITRIX_DISK_WEBHOOK_URL}/disk.storage.getlist.json",
+            f"{BITRIX_WEBHOOK_URL}/disk.storage.getlist.json",
             timeout=20
         )
         print(f"storage.getlist status={storage_resp.status_code}")
-        print(f"storage.getlist response={safe_preview(storage_resp.text, 1000)}")
-
         storages = storage_resp.json().get("result", [])
-        # Берём личное хранилище (type=1) или первое доступное
         user_storage = next((s for s in storages if str(s.get("TYPE")) == "1"), None)
         if not user_storage and storages:
             user_storage = storages[0]
 
-        if not user_storage:
-            raise ValueError("Не найдено ни одного хранилища")
+        if user_storage:
+            root_folder_id = user_storage.get("ROOT_OBJECT_ID") or user_storage.get("ID")
+            print(f"Root folder ID: {root_folder_id}")
 
-        root_folder_id = user_storage.get("ROOT_OBJECT_ID") or user_storage.get("ID")
-        print(f"Root folder ID: {root_folder_id}")
-
-        # Шаг 2: загружаем файл в корневую папку через disk-вебхук
-        upload_resp = requests.post(
-            f"{BITRIX_DISK_WEBHOOK_URL}/disk.folder.uploadfile.json",
-            json={
-                "id": root_folder_id,
-                "fileContent": [filename, encoded],
-                "data": {"NAME": filename},
-            },
-            timeout=60,
-        )
-        print(f"uploadfile status={upload_resp.status_code}")
-        print(f"uploadfile response={safe_preview(upload_resp.text, 2000)}")
-
-        upload_result = upload_resp.json().get("result", {})
-        download_url = (
-            upload_result.get("DOWNLOAD_URL")
-            or upload_result.get("DETAIL_URL")
-        )
-
-        if download_url:
-            # Шаг 3: отправляем ссылку через imbot
-            send_message(
-                dialog_id,
-                f"📎 [url={download_url}]Скачать {filename}[/url]"
+            # Загружаем через multipart/form-data
+            upload_resp = requests.post(
+                f"{BITRIX_WEBHOOK_URL}/disk.folder.uploadfile.json",
+                data={"id": root_folder_id, "data[NAME]": filename},
+                files={"file": (filename, content_bytes, "text/csv")},
+                timeout=60,
             )
-            print(f"send_file: sent download link {download_url}")
-            return
+            print(f"uploadfile multipart status={upload_resp.status_code}")
+            print(f"uploadfile multipart response={safe_preview(upload_resp.text, 1000)}")
 
-        raise ValueError(f"uploadfile не вернул download_url. result={safe_preview(upload_result, 500)}")
+            upload_result = upload_resp.json().get("result", {})
+            download_url = (
+                upload_result.get("DOWNLOAD_URL")
+                or upload_result.get("DETAIL_URL")
+            )
+            if download_url:
+                send_message(dialog_id, f"📎 [url={download_url}]Скачать {filename}[/url]")
+                return
 
     except Exception as e:
-        print(f"send_file error: {e}")
-        send_message(dialog_id, f"⚠️ Не удалось отправить файл: {e}")
+        print(f"send_file upload error: {e}")
+
+    send_message(dialog_id, f"⚠️ Не удалось отправить файл автоматически. Обратитесь к администратору.")
 
 
 # ─────────────────────────────────────────────
@@ -324,7 +330,7 @@ def extract_transactions(pdf_bytes):
 
     msg = client.messages.create(
         model="claude-opus-4-6",
-        max_tokens=8000,
+        max_tokens=16000,
         system=system_prompt,
         messages=[{
             "role": "user",
