@@ -102,56 +102,87 @@ def send_message(dialog_id, text):
 
 def send_file(dialog_id, filename, content_bytes):
     """
-    Загружает CSV на Bitrix Disk через disk-вебхук,
-    затем шлёт ссылку в чат через основной вебхук.
+    Двухшаговая загрузка на Bitrix Disk через disk-вебхук:
+    1. disk.folder.uploadfile → получаем uploadUrl
+    2. POST файла на uploadUrl → получаем DOWNLOAD_URL
+    3. Шлём ссылку в чат
     """
     if not dialog_id:
         print("send_file skipped: no dialog_id")
         return
 
-    # ── Вариант 1: disk.folder.uploadfile через DISK-вебхук ──────────────────
+    # ── Вариант 1: двухшаговый upload через disk-вебхук ──────────────────────
     try:
+        # Шаг 1а: получаем список хранилищ
         storage_resp = requests.get(
             f"{BITRIX_DISK_WEBHOOK_URL}/disk.storage.getlist.json",
             timeout=20,
         )
         print(f"[disk] storage.getlist status={storage_resp.status_code}")
-        print(f"[disk] storage.getlist response={safe_preview(storage_resp.text, 500)}")
-
         storages = storage_resp.json().get("result", [])
-        user_storage = next((s for s in storages if str(s.get("TYPE")) == "1"), None)
+
+        # Берём общий диск (TYPE=common) или первое хранилище
+        user_storage = next((s for s in storages if str(s.get("TYPE")) == "common"), None)
+        if not user_storage:
+            user_storage = next((s for s in storages if str(s.get("TYPE")) == "1"), None)
         if not user_storage and storages:
             user_storage = storages[0]
 
-        if user_storage:
-            root_folder_id = user_storage.get("ROOT_OBJECT_ID") or user_storage.get("ID")
-            print(f"[disk] root_folder_id={root_folder_id}")
-
-            upload_resp = requests.post(
-                f"{BITRIX_DISK_WEBHOOK_URL}/disk.folder.uploadfile.json",
-                data={"id": root_folder_id, "data[NAME]": filename},
-                files={"file": (filename, content_bytes, "text/csv")},
-                timeout=60,
-            )
-            print(f"[disk] uploadfile status={upload_resp.status_code}")
-            print(f"[disk] uploadfile response={safe_preview(upload_resp.text, 1000)}")
-
-            upload_result = upload_resp.json().get("result", {})
-            download_url = (
-                upload_result.get("DOWNLOAD_URL")
-                or upload_result.get("DETAIL_URL")
-            )
-            if download_url:
-                send_message(dialog_id, f"📎 [url={download_url}]Скачать {filename}[/url]")
-                print(f"send_file OK via disk webhook: {download_url[:100]}")
-                return
-            else:
-                print(f"[disk] upload_result без URL: {safe_preview(upload_result, 500)}")
-        else:
+        if not user_storage:
             print("[disk] хранилище не найдено")
+            raise Exception("Хранилище не найдено")
+
+        root_folder_id = user_storage.get("ROOT_OBJECT_ID") or user_storage.get("ID")
+        print(f"[disk] storage={user_storage.get('NAME')}, root_folder_id={root_folder_id}")
+
+        # Шаг 1б: запрашиваем uploadUrl
+        step1_resp = requests.post(
+            f"{BITRIX_DISK_WEBHOOK_URL}/disk.folder.uploadfile.json",
+            data={"id": root_folder_id, "data[NAME]": filename},
+            timeout=30,
+        )
+        print(f"[disk] step1 (get uploadUrl) status={step1_resp.status_code}")
+        step1_result = step1_resp.json().get("result", {})
+        print(f"[disk] step1 result={safe_preview(step1_result, 300)}")
+
+        upload_url = step1_result.get("uploadUrl")
+        if not upload_url:
+            raise Exception(f"uploadUrl не получен: {step1_result}")
+
+        # Шаг 2: загружаем файл на uploadUrl
+        print(f"[disk] step2: uploading to uploadUrl...")
+        step2_resp = requests.post(
+            upload_url,
+            files={"file": (filename, content_bytes, "text/csv")},
+            timeout=60,
+        )
+        print(f"[disk] step2 (upload file) status={step2_resp.status_code}")
+        print(f"[disk] step2 response={safe_preview(step2_resp.text, 1000)}")
+
+        # Bitrix может вернуть результат как список или как объект
+        step2_data = step2_resp.json()
+        file_result = step2_data
+        if isinstance(step2_data, list) and step2_data:
+            file_result = step2_data[0]
+        elif isinstance(step2_data, dict):
+            file_result = step2_data.get("result") or step2_data
+
+        download_url = (
+            file_result.get("DOWNLOAD_URL")
+            or file_result.get("DETAIL_URL")
+            or file_result.get("download_url")
+        )
+        print(f"[disk] download_url={safe_preview(download_url, 200)}")
+
+        if download_url:
+            send_message(dialog_id, f"📎 [url={download_url}]Скачать {filename}[/url]")
+            print(f"send_file OK: {download_url[:80]}")
+            return
+        else:
+            raise Exception(f"DOWNLOAD_URL не найден в ответе: {safe_preview(file_result, 300)}")
 
     except Exception as e:
-        print(f"[disk] send_file error: {e}")
+        print(f"[disk] send_file upload error: {e}")
 
     # ── Вариант 2: im.disk.file.commit через основной вебхук ─────────────────
     try:
@@ -170,7 +201,7 @@ def send_file(dialog_id, filename, content_bytes):
     except Exception as e:
         print(f"[main] im.disk.file.commit error: {e}")
 
-    # ── Вариант 3: превью в тексте сообщения ─────────────────────────────────
+    # ── Вариант 3: превью в тексте ────────────────────────────────────────────
     try:
         csv_text = content_bytes.decode("utf-8-sig")
         lines = csv_text.strip().split("\n")
@@ -179,7 +210,7 @@ def send_file(dialog_id, filename, content_bytes):
             dialog_id,
             f"⚠️ Файл не удалось прикрепить. Первые строки:\n\n[CODE]{preview}[/CODE]\n\nВсего строк: {len(lines) - 1}"
         )
-        print("send_file: отправлен текстовый превью")
+        print("send_file: текстовый превью отправлен")
     except Exception as e:
         print(f"send_file variant 3 error: {e}")
         send_message(dialog_id, "⚠️ Не удалось отправить файл. Обратитесь к администратору.")
@@ -251,7 +282,7 @@ def try_download(url, extra_headers=None):
     if resp.status_code != 200:
         return None
     if "text/html" in content_type:
-        print(f"try_download FAIL: HTML page, body={safe_preview(resp.text, 200)}")
+        print(f"try_download FAIL: HTML, body={safe_preview(resp.text, 200)}")
         return None
     if "application/pdf" in content_type or "application/octet-stream" in content_type or first_bytes.startswith(b"%PDF"):
         return resp.content
