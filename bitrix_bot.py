@@ -7,18 +7,18 @@ import threading
 import requests
 from urllib.parse import parse_qs
 from flask import Flask, request, jsonify
-import anthropichttps://github.com/alanmyradiants/dds-bot/blob/main/bitrix_bot.py
+import anthropic
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 
-ANTHROPIC_API_KEY      = os.getenv("ANTHROPIC_API_KEY", "").strip()
-# Вебхук с imbot-скоупом — для отправки сообщений
-BITRIX_WEBHOOK_URL     = os.getenv("BITRIX_WEBHOOK_URL", "https://joto.bitrix24.ru/rest/1/9pkspu2vkwp1zkrs").rstrip("/")
-# Отдельный вебхук только с disk-скоупом — для скачивания файлов
-# Создайте новый входящий вебхук в Bitrix24 с правом "Диск (disk)" и вставьте URL сюда
-BITRIX_DISK_WEBHOOK_URL = os.getenv("BITRIX_DISK_WEBHOOK_URL", BITRIX_WEBHOOK_URL).rstrip("/")
-BOT_CLIENT_ID          = os.getenv("BOT_CLIENT_ID", "glhjxdm0jwb216zd3kdau2mwtf4z0fbu")
+ANTHROPIC_API_KEY       = os.getenv("ANTHROPIC_API_KEY", "").strip()
+BITRIX_WEBHOOK_URL      = os.getenv("BITRIX_WEBHOOK_URL", "https://joto.bitrix24.ru/rest/1/ge7hgsje88e51nuw").rstrip("/")
+BITRIX_DISK_WEBHOOK_URL = os.getenv("BITRIX_DISK_WEBHOOK_URL", "https://joto.bitrix24.ru/rest/1/g4s7w21uysosjds7").rstrip("/")
+BOT_CLIENT_ID           = os.getenv("BOT_CLIENT_ID", "glhjxdm0jwb216zd3kdau2mwtf4z0fbu")
+
+# Извлекаем токен из disk-вебхука для Bearer-авторизации
+DISK_TOKEN = BITRIX_DISK_WEBHOOK_URL.rstrip("/").split("/")[-1]
 
 DDS_CATEGORIES = [
     "Поступления от покупателей",
@@ -162,7 +162,6 @@ def find_pdf_in_payload(data):
 
 
 def get_disk_file_info(file_id):
-    """Используем отдельный disk-вебхук без imbot-скоупа."""
     url = f"{BITRIX_DISK_WEBHOOK_URL}/disk.file.get.json"
     response = requests.get(url, params={"id": file_id}, timeout=20)
     print(f"disk.file.get GET status={response.status_code}")
@@ -178,71 +177,63 @@ def get_disk_file_info(file_id):
     return result
 
 
-def extract_download_url_from_disk_info(file_info):
-    for key in ["DOWNLOAD_URL", "downloadUrl", "DOWNLOAD_URL_MACHINE", "URL_DOWNLOAD", "urlDownload"]:
+def extract_download_url(file_info):
+    for key in ["DOWNLOAD_URL", "downloadUrl", "DOWNLOAD_URL_MACHINE", "URL_DOWNLOAD"]:
         value = file_info.get(key)
         if value:
             return value
-    for outer_val in file_info.values():
-        if isinstance(outer_val, dict):
-            for key in ["DOWNLOAD_URL", "downloadUrl"]:
-                value = outer_val.get(key)
-                if value:
-                    return value
     return None
 
 
-def download_pdf(url):
-    session = requests.Session()
-    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/pdf,application/octet-stream,*/*"}
-    response = session.get(url, headers=headers, timeout=60, allow_redirects=True)
-    content_type = (response.headers.get("Content-Type") or "").lower()
-    print(f"download_pdf status={response.status_code}")
-    print(f"download_pdf content_type={content_type}")
-    print(f"download_pdf first_bytes={response.content[:20]}")
-    if response.status_code != 200:
-        raise ValueError(f"Ошибка скачивания: HTTP {response.status_code}")
-    if "application/pdf" in content_type or response.content.startswith(b"%PDF"):
-        return response.content
-    preview = response.text[:300].replace("\n", " ") if response.text else str(response.content[:200])
-    raise ValueError(f"Получили не PDF, а {content_type}: {preview}")
+def try_download(url, extra_headers=None):
+    """Попытка скачать PDF по URL."""
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/pdf,application/octet-stream,*/*",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    resp = requests.get(url, headers=headers, timeout=60, allow_redirects=True)
+    content_type = (resp.headers.get("Content-Type") or "").lower()
+    print(f"try_download status={resp.status_code} content_type={content_type} first={resp.content[:20]}")
+    if resp.status_code == 200 and (
+        "application/pdf" in content_type or resp.content.startswith(b"%PDF")
+    ):
+        return resp.content
+    return None
 
 
 def get_pdf_bytes(file_id, fallback_url=None):
-    # Вариант 1: disk.file.download через disk-вебхук
-    try:
-        url = f"{BITRIX_DISK_WEBHOOK_URL}/disk.file.download/"
-        print(f"Trying REST download via disk webhook: {url}?id={file_id}")
-        resp = requests.get(url, params={"id": file_id},
-                            headers={"User-Agent": "Mozilla/5.0"},
-                            timeout=60, allow_redirects=True)
-        content_type = (resp.headers.get("Content-Type") or "").lower()
-        print(f"REST download status={resp.status_code} content_type={content_type}")
-        print(f"REST download first_bytes={resp.content[:20]}")
-        if resp.status_code == 200 and (
-            "application/pdf" in content_type or resp.content.startswith(b"%PDF")
-        ):
-            return resp.content
-        print("REST download did not return PDF, trying disk.file.get...")
-    except Exception as e:
-        print(f"REST download exception: {e}")
-
-    # Вариант 2: disk.file.get → токенизированный DOWNLOAD_URL
+    # Вариант 1: disk.file.get → DOWNLOAD_URL с токеном
     try:
         disk_info = get_disk_file_info(file_id)
         print("===== DISK FILE INFO =====")
         print(safe_preview(disk_info, 5000))
-        download_url = extract_download_url_from_disk_info(disk_info)
+        download_url = extract_download_url(disk_info)
         if download_url:
             print(f"DOWNLOAD URL FROM DISK: {safe_preview(download_url, 500)}")
-            return download_pdf(download_url)
+            result = try_download(download_url)
+            if result:
+                return result
     except Exception as e:
         print(f"disk.file.get failed: {e}")
 
+    # Вариант 2: fallback_url с Bearer-токеном disk-вебхука
+    if fallback_url:
+        print(f"Trying fallback_url with Bearer token...")
+        result = try_download(fallback_url, {"Authorization": f"Bearer {DISK_TOKEN}"})
+        if result:
+            return result
+
+        # Вариант 3: fallback_url без авторизации (вдруг открытый)
+        print("Trying fallback_url without auth...")
+        result = try_download(fallback_url)
+        if result:
+            return result
+
     raise ValueError(
-        "Не удалось скачать PDF. "
-        "Создайте новый вебхук Bitrix24 только с правом 'Диск (disk)' "
-        "и добавьте его URL в Railway как BITRIX_DISK_WEBHOOK_URL"
+        "Не удалось скачать PDF.\n"
+        "Добавьте скоуп 'Чат и уведомления (im)' к вебхуку 9pkspu2vkwp1zkrs в Bitrix24."
     )
 
 
@@ -303,7 +294,10 @@ def to_csv(transactions):
         amount = float(t.get("amount", 0) or 0)
         inc = f"{amount:.2f}" if t.get("type") == "in" else ""
         exp = f"{amount:.2f}" if t.get("type") == "out" else ""
-        writer.writerow([t.get("date",""), t.get("counterparty",""), t.get("description",""), inc, exp, t.get("category","")])
+        writer.writerow([
+            t.get("date", ""), t.get("counterparty", ""),
+            t.get("description", ""), inc, exp, t.get("category", ""),
+        ])
     return ("\ufeff" + out.getvalue()).encode("utf-8")
 
 
@@ -342,8 +336,8 @@ def bot_handler():
 
     data = parse_request_data()
 
-    print("===== WEBHOOK IN USE =====")
-    print(f"BOT: {BITRIX_WEBHOOK_URL}")
+    print("===== WEBHOOKS =====")
+    print(f"BOT:  {BITRIX_WEBHOOK_URL}")
     print(f"DISK: {BITRIX_DISK_WEBHOOK_URL}")
     print("===== INCOMING REQUEST =====")
     print(safe_preview(data, 10000))
@@ -364,8 +358,8 @@ def bot_handler():
     print("===== FOUND FILE INFO =====")
     print(safe_preview(file_info, 4000))
 
-    file_id = file_info.get("file_id")
-    filename = file_info.get("filename") or ""
+    file_id    = file_info.get("file_id")
+    filename   = file_info.get("filename") or ""
     fallback_url = file_info.get("url_download")
 
     if filename.lower().endswith(".pdf") and file_id:
@@ -376,10 +370,12 @@ def bot_handler():
             daemon=True,
         )
         thread.start()
+
     elif message_text in ("привет", "start", "/start", "помощь", "help", ""):
         send_message(
             dialog_id,
-            "👋 Привет! Пришли PDF-выписку из банка — я разнесу транзакции по статьям ДДС и верну CSV-файл.",
+            "👋 Привет! Пришли PDF-выписку из банка — "
+            "я разнесу транзакции по статьям ДДС и верну CSV-файл.",
         )
     else:
         send_message(dialog_id, "Пришли PDF-выписку из банка.")
@@ -394,7 +390,7 @@ def health():
 
 if __name__ == "__main__":
     print("===== STARTING APP =====")
-    print(f"BOT WEBHOOK: {BITRIX_WEBHOOK_URL}")
+    print(f"BOT WEBHOOK:  {BITRIX_WEBHOOK_URL}")
     print(f"DISK WEBHOOK: {BITRIX_DISK_WEBHOOK_URL}")
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
