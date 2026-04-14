@@ -454,48 +454,45 @@ def try_download(url, extra_headers=None):
 
 
 def get_pdf_bytes(file_id, fallback_url=None):
-    import time
+    """Скачивает PDF — каждый раз получаем свежий URL и сразу качаем."""
 
-    # Вариант 1: основной вебхук
-    try:
-        response = requests.get(f"{BITRIX_WEBHOOK_URL}/disk.file.get.json", params={"id": file_id}, timeout=30)
-        print(f"disk.file.get via main webhook status={response.status_code}")
-        if response.status_code == 200:
-            payload = response.json()
-            if payload.get("result"):
-                dl = extract_download_url(payload["result"])
-                if dl:
-                    result = try_download(dl)
-                    if result:
-                        return result
-    except Exception as e:
-        print(f"main webhook failed: {e}")
-
-    # Вариант 2: disk-вебхук (3 попытки с паузой)
-    for attempt in range(3):
+    def try_via_webhook(webhook_url, label):
+        """Получает свежий DOWNLOAD_URL и сразу скачивает файл."""
         try:
-            print(f"disk webhook attempt {attempt + 1}/3")
-            response = requests.get(
-                f"{BITRIX_DISK_WEBHOOK_URL}/disk.file.get.json",
+            resp = requests.get(
+                f"{webhook_url}/disk.file.get.json",
                 params={"id": file_id},
-                timeout=45,
+                timeout=30,
             )
-            print(f"disk webhook status={response.status_code}")
-            if response.status_code == 200:
-                payload = response.json()
-                if payload.get("result"):
-                    dl = extract_download_url(payload["result"])
-                    if dl:
-                        result = try_download(dl)
-                        if result:
-                            return result
-            break
+            print(f"[{label}] disk.file.get status={resp.status_code}")
+            if resp.status_code != 200:
+                return None
+            payload = resp.json()
+            if not payload.get("result"):
+                return None
+            dl = extract_download_url(payload["result"])
+            if not dl:
+                print(f"[{label}] no download_url in result")
+                return None
+            print(f"[{label}] downloading immediately...")
+            return try_download(dl)
         except Exception as e:
-            print(f"disk webhook attempt {attempt + 1} failed: {e}")
-            if attempt < 2:
-                time.sleep(5)
+            print(f"[{label}] failed: {e}")
+            return None
 
-    # Вариант 3 & 4: fallback_url
+    # Попытка 1: основной вебхук
+    result = try_via_webhook(BITRIX_WEBHOOK_URL, "main")
+    if result:
+        return result
+
+    # Попытки 2-4: disk-вебхук (3 раза, каждый раз свежий URL)
+    for attempt in range(3):
+        print(f"disk webhook attempt {attempt + 1}/3")
+        result = try_via_webhook(BITRIX_DISK_WEBHOOK_URL, f"disk-{attempt+1}")
+        if result:
+            return result
+
+    # Fallback URL из payload
     if fallback_url:
         for label, token in [("main", BITRIX_WEBHOOK_URL.rstrip("/").split("/")[-1]), ("disk", DISK_TOKEN)]:
             print(f"Trying fallback_url with {label} Bearer token")
