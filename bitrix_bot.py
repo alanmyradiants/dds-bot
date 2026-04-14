@@ -289,7 +289,7 @@ def init_sheets():
         ).execute()
 
     # Заголовки Транзакции — вставляем принудительно в строку 1
-    headers = [["Дата загрузки", "Дата операции", "Контрагент",
+    headers = [["Дата загрузки", "Дата операции", "Время", "Дата обработки", "Код авторизации", "Месяц", "Контрагент",
                 "Описание", "Приход", "Расход", "Категория",
                 "Личное/Бизнес", "Статус"]]
 
@@ -419,9 +419,24 @@ def write_to_sheets(transactions):
             if counterparty_upper not in sheet_rules and counterparty not in new_rules:
                 new_rules[counterparty] = (category, biz_type)
 
+        # Извлекаем месяц из даты (формат ДД.ММ.ГГГГ → Апрель 2026)
+        date_str = t.get("date", "")
+        try:
+            from datetime import datetime as dt
+            d = dt.strptime(date_str, "%d.%m.%Y")
+            months_ru = ["","Январь","Февраль","Март","Апрель","Май","Июнь",
+                         "Июль","Август","Сентябрь","Октябрь","Ноябрь","Декабрь"]
+            month_label = f"{months_ru[d.month]} {d.year}"
+        except Exception:
+            month_label = ""
+
         rows.append([
             upload_date,
-            t.get("date", ""),
+            date_str,
+            t.get("time", ""),
+            t.get("processing_date", ""),
+            t.get("auth_code", ""),
+            month_label,
             counterparty,
             description,
             inc,
@@ -434,7 +449,7 @@ def write_to_sheets(transactions):
     # Записываем транзакции
     service.spreadsheets().values().append(
         spreadsheetId=SHEET_ID,
-        range="Транзакции!A:I",
+        range="Транзакции!A:M",
         valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body={"values": rows},
@@ -590,14 +605,31 @@ def extract_transactions(pdf_bytes):
 
     pdf_b64 = base64.b64encode(pdf_bytes).decode()
 
-    system_prompt = f"""Из банковской выписки извлеки ВСЕ транзакции.
+    system_prompt = f"""Из банковской выписки Сбербанка извлеки ВСЕ транзакции.
+
+Каждая транзакция в выписке содержит две строки:
+- Первая: дата операции, время, категория, сумма
+- Вторая: дата обработки, код авторизации, описание операции
 
 Верни ТОЛЬКО JSON массив без markdown:
-[{{"date":"ДД.ММ.ГГГГ","description":"текст","amount":100.0,"type":"in","counterparty":"контрагент"}}]
+[{{
+  "date": "ДД.ММ.ГГГГ",
+  "time": "ЧЧ:ММ",
+  "processing_date": "ДД.ММ.ГГГГ",
+  "auth_code": "646991",
+  "description": "текст описания",
+  "amount": 100.0,
+  "type": "in",
+  "counterparty": "краткое название"
+}}]
 
-type: in=поступление, out=списание. amount всегда положительное.
-Контрагент — краткое название (например "Пятёрочка", "Яндекс GO", "М. Дария Руслановна").
-НЕ добавляй поле category — категории проставим отдельно."""
+Правила:
+- type: in=поступление/зачисление, out=списание. amount всегда положительное.
+- counterparty — краткое понятное название ("Пятёрочка", "Яндекс GO", "М. Дария Руслановна")
+- auth_code — код авторизации (6 цифр), если есть
+- time — время операции в формате ЧЧ:ММ
+- processing_date — дата обработки (вторая строка транзакции)
+- НЕ добавляй поле category"""
 
     with client.messages.stream(
         model="claude-sonnet-4-6",
