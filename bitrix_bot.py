@@ -17,7 +17,6 @@ BITRIX_WEBHOOK_URL      = os.getenv("BITRIX_WEBHOOK_URL", "https://joto.bitrix24
 BITRIX_DISK_WEBHOOK_URL = os.getenv("BITRIX_DISK_WEBHOOK_URL", "https://joto.bitrix24.ru/rest/1/g4s7w21uysosjds7").rstrip("/")
 BOT_CLIENT_ID           = os.getenv("BOT_CLIENT_ID", "glhjxdm0jwb216zd3kdau2mwtf4z0fbu")
 
-# Извлекаем токен из disk-вебхука для Bearer-авторизации
 DISK_TOKEN = BITRIX_DISK_WEBHOOK_URL.rstrip("/").split("/")[-1]
 
 DDS_CATEGORIES = [
@@ -102,39 +101,23 @@ def send_message(dialog_id, text):
 
 
 def send_file(dialog_id, filename, content_bytes):
+    """
+    Загружает CSV на Bitrix Disk через disk-вебхук,
+    затем шлёт ссылку в чат через основной вебхук.
+    """
     if not dialog_id:
         print("send_file skipped: no dialog_id")
         return
 
-    encoded = base64.b64encode(content_bytes).decode()
-
-    # Вариант 1: im.disk.file.commit через основной вебхук
-    try:
-        resp = requests.post(
-            f"{BITRIX_WEBHOOK_URL}/im.disk.file.commit.json",
-            json={
-                "DIALOG_ID": dialog_id,
-                "FILE_NAME": filename,
-                "FILE_CONTENT": encoded,
-            },
-            timeout=60,
-        )
-        print(f"im.disk.file.commit status={resp.status_code}")
-        print(f"im.disk.file.commit response={safe_preview(resp.text, 500)}")
-        result = resp.json()
-        if resp.status_code == 200 and "error" not in result:
-            print("send_file: im.disk.file.commit success")
-            return
-    except Exception as e:
-        print(f"im.disk.file.commit error: {e}")
-
-    # Вариант 2: загрузка через multipart на диск + ссылка
+    # ── Вариант 1: disk.folder.uploadfile через DISK-вебхук ──────────────────
     try:
         storage_resp = requests.get(
-            f"{BITRIX_WEBHOOK_URL}/disk.storage.getlist.json",
-            timeout=20
+            f"{BITRIX_DISK_WEBHOOK_URL}/disk.storage.getlist.json",
+            timeout=20,
         )
-        print(f"storage.getlist status={storage_resp.status_code}")
+        print(f"[disk] storage.getlist status={storage_resp.status_code}")
+        print(f"[disk] storage.getlist response={safe_preview(storage_resp.text, 500)}")
+
         storages = storage_resp.json().get("result", [])
         user_storage = next((s for s in storages if str(s.get("TYPE")) == "1"), None)
         if not user_storage and storages:
@@ -142,16 +125,16 @@ def send_file(dialog_id, filename, content_bytes):
 
         if user_storage:
             root_folder_id = user_storage.get("ROOT_OBJECT_ID") or user_storage.get("ID")
-            print(f"Root folder ID: {root_folder_id}")
+            print(f"[disk] root_folder_id={root_folder_id}")
 
             upload_resp = requests.post(
-                f"{BITRIX_WEBHOOK_URL}/disk.folder.uploadfile.json",
+                f"{BITRIX_DISK_WEBHOOK_URL}/disk.folder.uploadfile.json",
                 data={"id": root_folder_id, "data[NAME]": filename},
                 files={"file": (filename, content_bytes, "text/csv")},
                 timeout=60,
             )
-            print(f"uploadfile multipart status={upload_resp.status_code}")
-            print(f"uploadfile multipart response={safe_preview(upload_resp.text, 1000)}")
+            print(f"[disk] uploadfile status={upload_resp.status_code}")
+            print(f"[disk] uploadfile response={safe_preview(upload_resp.text, 1000)}")
 
             upload_result = upload_resp.json().get("result", {})
             download_url = (
@@ -160,12 +143,46 @@ def send_file(dialog_id, filename, content_bytes):
             )
             if download_url:
                 send_message(dialog_id, f"📎 [url={download_url}]Скачать {filename}[/url]")
+                print(f"send_file OK via disk webhook: {download_url[:100]}")
                 return
+            else:
+                print(f"[disk] upload_result без URL: {safe_preview(upload_result, 500)}")
+        else:
+            print("[disk] хранилище не найдено")
 
     except Exception as e:
-        print(f"send_file upload error: {e}")
+        print(f"[disk] send_file error: {e}")
 
-    send_message(dialog_id, f"⚠️ Не удалось отправить файл автоматически. Обратитесь к администратору.")
+    # ── Вариант 2: im.disk.file.commit через основной вебхук ─────────────────
+    try:
+        encoded = base64.b64encode(content_bytes).decode()
+        resp = requests.post(
+            f"{BITRIX_WEBHOOK_URL}/im.disk.file.commit.json",
+            json={"DIALOG_ID": dialog_id, "FILE_NAME": filename, "FILE_CONTENT": encoded},
+            timeout=60,
+        )
+        print(f"[main] im.disk.file.commit status={resp.status_code}")
+        print(f"[main] im.disk.file.commit response={safe_preview(resp.text, 500)}")
+        result = resp.json()
+        if resp.status_code == 200 and "error" not in result:
+            print("send_file OK via im.disk.file.commit")
+            return
+    except Exception as e:
+        print(f"[main] im.disk.file.commit error: {e}")
+
+    # ── Вариант 3: превью в тексте сообщения ─────────────────────────────────
+    try:
+        csv_text = content_bytes.decode("utf-8-sig")
+        lines = csv_text.strip().split("\n")
+        preview = "\n".join(lines[:6])
+        send_message(
+            dialog_id,
+            f"⚠️ Файл не удалось прикрепить. Первые строки:\n\n[CODE]{preview}[/CODE]\n\nВсего строк: {len(lines) - 1}"
+        )
+        print("send_file: отправлен текстовый превью")
+    except Exception as e:
+        print(f"send_file variant 3 error: {e}")
+        send_message(dialog_id, "⚠️ Не удалось отправить файл. Обратитесь к администратору.")
 
 
 # ─────────────────────────────────────────────
@@ -216,11 +233,6 @@ def extract_download_url(file_info):
 
 
 def try_download(url, extra_headers=None):
-    """
-    Скачивает файл по URL.
-    Принимает: application/pdf, application/octet-stream, или байты начинающиеся с %PDF.
-    Отвергает только явный HTML (вероятно, страница логина).
-    """
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/pdf,application/octet-stream,*/*",
@@ -233,95 +245,67 @@ def try_download(url, extra_headers=None):
     first_bytes = resp.content[:20] if resp.content else b""
     content_len = len(resp.content)
 
-    print(f"try_download status={resp.status_code} "
-          f"content_type={content_type} "
-          f"size={content_len} "
-          f"first={first_bytes}")
+    print(f"try_download status={resp.status_code} ct={content_type} "
+          f"size={content_len} first={first_bytes}")
 
     if resp.status_code != 200:
-        print(f"try_download FAIL: non-200 status")
         return None
-
-    # Явный HTML — скорее всего редирект на страницу логина
     if "text/html" in content_type:
-        print(f"try_download FAIL: got HTML (login page?), body={safe_preview(resp.text, 300)}")
+        print(f"try_download FAIL: HTML page, body={safe_preview(resp.text, 200)}")
         return None
-
-    # Принимаем PDF, octet-stream, или любой файл начинающийся с %PDF
-    is_pdf_content_type = "application/pdf" in content_type
-    is_octet_stream     = "application/octet-stream" in content_type
-    is_pdf_magic        = first_bytes.startswith(b"%PDF")
-
-    if is_pdf_content_type or is_octet_stream or is_pdf_magic:
-        print(f"try_download OK: got {content_len} bytes")
+    if "application/pdf" in content_type or "application/octet-stream" in content_type or first_bytes.startswith(b"%PDF"):
         return resp.content
-
-    # Неизвестный тип — принимаем если размер разумный (>1KB) и не HTML
     if content_len > 1024:
-        print(f"try_download OK (unknown type, size OK): {content_type}, {content_len} bytes")
+        print(f"try_download OK (unknown type, size OK)")
         return resp.content
 
-    print(f"try_download FAIL: unrecognized content_type={content_type}, size={content_len}")
+    print(f"try_download FAIL: ct={content_type}, size={content_len}")
     return None
 
 
 def get_pdf_bytes(file_id, fallback_url=None):
-    # Вариант 1: disk.file.get через основной вебхук
+    # Вариант 1: основной вебхук
     try:
-        url = f"{BITRIX_WEBHOOK_URL}/disk.file.get.json"
-        response = requests.get(url, params={"id": file_id}, timeout=20)
+        response = requests.get(f"{BITRIX_WEBHOOK_URL}/disk.file.get.json", params={"id": file_id}, timeout=20)
         print(f"disk.file.get via main webhook status={response.status_code}")
         if response.status_code == 200:
             payload = response.json()
-            if "result" in payload and payload["result"]:
-                download_url = extract_download_url(payload["result"])
-                if download_url:
-                    print(f"Variant 1 DOWNLOAD_URL: {safe_preview(download_url, 200)}")
-                    result = try_download(download_url)
+            if payload.get("result"):
+                dl = extract_download_url(payload["result"])
+                if dl:
+                    result = try_download(dl)
                     if result:
                         return result
     except Exception as e:
-        print(f"disk.file.get via main webhook failed: {e}")
+        print(f"main webhook failed: {e}")
 
-    # Вариант 2: disk.file.get через disk-вебхук
+    # Вариант 2: disk-вебхук
     try:
-        url = f"{BITRIX_DISK_WEBHOOK_URL}/disk.file.get.json"
-        response = requests.get(url, params={"id": file_id}, timeout=20)
+        response = requests.get(f"{BITRIX_DISK_WEBHOOK_URL}/disk.file.get.json", params={"id": file_id}, timeout=20)
         print(f"disk.file.get via disk webhook status={response.status_code}")
         if response.status_code == 200:
             payload = response.json()
-            print(f"disk.file.get result keys: {list(payload.get('result', {}).keys())}")
-            if "result" in payload and payload["result"]:
-                download_url = extract_download_url(payload["result"])
-                print(f"Variant 2 extracted download_url: {safe_preview(download_url, 200)}")
-                if download_url:
-                    result = try_download(download_url)
+            print(f"disk result keys: {list(payload.get('result', {}).keys())}")
+            if payload.get("result"):
+                dl = extract_download_url(payload["result"])
+                print(f"extracted download_url: {safe_preview(dl, 200)}")
+                if dl:
+                    result = try_download(dl)
                     if result:
                         return result
-                    print("Variant 2 try_download returned None")
-                else:
-                    print(f"Variant 2: extract_download_url=None. Full result: {safe_preview(payload['result'], 1000)}")
+                    print("try_download returned None")
     except Exception as e:
-        print(f"disk.file.get via disk webhook failed: {e}")
+        print(f"disk webhook failed: {e}")
 
-    # Вариант 3: fallback_url с Bearer токеном основного вебхука
+    # Вариант 3 & 4: fallback_url
     if fallback_url:
-        main_token = BITRIX_WEBHOOK_URL.rstrip("/").split("/")[-1]
-        print(f"Variant 3: fallback_url with main Bearer token")
-        result = try_download(fallback_url, {"Authorization": f"Bearer {main_token}"})
-        if result:
-            return result
+        for label, token in [("main", BITRIX_WEBHOOK_URL.rstrip("/").split("/")[-1]), ("disk", DISK_TOKEN)]:
+            print(f"Trying fallback_url with {label} Bearer token")
+            result = try_download(fallback_url, {"Authorization": f"Bearer {token}"})
+            if result:
+                return result
 
-        # Вариант 4: fallback_url с Bearer токеном disk-вебхука
-        print(f"Variant 4: fallback_url with disk Bearer token")
-        result = try_download(fallback_url, {"Authorization": f"Bearer {DISK_TOKEN}"})
-        if result:
-            return result
-
-    raise ValueError(
-        "Не удалось скачать PDF. "
-        "Проверьте логи — нужно посмотреть какой статус возвращает disk.file.get."
-    )
+    raise ValueError("Не удалось скачать PDF. Проверьте логи.")
 
 
 # ─────────────────────────────────────────────
@@ -355,12 +339,12 @@ def extract_transactions(pdf_bytes):
         }],
     ) as stream:
         text = stream.get_final_text()
-    print(f"Claude FULL response: {safe_preview(text, 5000)}")
+    print(f"Claude response: {safe_preview(text, 5000)}")
 
     start = text.find("[")
     end = text.rfind("]")
     if start == -1 or end == -1 or end < start:
-        raise ValueError(f"Транзакции не найдены. Ответ Claude: {safe_preview(text, 300)}")
+        raise ValueError(f"Транзакции не найдены. Ответ: {safe_preview(text, 300)}")
 
     json_str = text[start:end + 1]
     try:
