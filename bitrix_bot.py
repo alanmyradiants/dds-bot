@@ -330,7 +330,7 @@ def extract_transactions(pdf_bytes):
 
     msg = client.messages.create(
         model="claude-opus-4-6",
-        max_tokens=16000,
+        max_tokens=32000,
         system=system_prompt,
         messages=[{
             "role": "user",
@@ -342,12 +342,12 @@ def extract_transactions(pdf_bytes):
     )
 
     text = msg.content[0].text
-    print(f"Claude response preview: {safe_preview(text, 1500)}")
+    print(f"Claude FULL response: {safe_preview(text, 5000)}")
 
     start = text.find("[")
     end = text.rfind("]")
     if start == -1 or end == -1 or end < start:
-        raise ValueError("Транзакции не найдены в ответе ИИ")
+        raise ValueError(f"Транзакции не найдены. Ответ Claude: {safe_preview(text, 300)}")
 
     json_str = text[start:end + 1]
     try:
