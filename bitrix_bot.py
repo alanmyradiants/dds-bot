@@ -192,6 +192,68 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
 # ─────────────────────────────────────────────
+# Проверка сервисов
+# ─────────────────────────────────────────────
+
+def check_all_services():
+    """Проверяет все сервисы и возвращает список проблем."""
+    problems = []
+
+    # 1. Проверка Anthropic API
+    try:
+        if not ANTHROPIC_API_KEY:
+            problems.append("❌ Anthropic API: ключ не указан")
+        else:
+            test = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=10,
+                messages=[{"role": "user", "content": "hi"}]
+            )
+            print("✅ Anthropic API: OK")
+    except anthropic.AuthenticationError:
+        problems.append("❌ Anthropic API: неверный ключ или не оплачен")
+    except anthropic.PermissionDeniedError:
+        problems.append("❌ Anthropic API: доступ запрещён, проверьте оплату")
+    except Exception as e:
+        problems.append(f"❌ Anthropic API: ошибка — {str(e)[:100]}")
+
+    # 2. Проверка Google Sheets
+    try:
+        svc = get_sheets_service()
+        svc.spreadsheets().get(spreadsheetId=SHEET_ID).execute()
+        print("✅ Google Sheets: OK")
+    except Exception as e:
+        err = str(e).lower()
+        if "403" in err or "permission" in err:
+            problems.append("❌ Google Sheets: нет доступа или ключ недействителен")
+        elif "404" in err:
+            problems.append("❌ Google Sheets: таблица не найдена")
+        else:
+            problems.append(f"❌ Google Sheets: ошибка — {str(e)[:100]}")
+
+    # 3. Проверка Bitrix24
+    try:
+        resp = requests.get(
+            f"{BITRIX_WEBHOOK_URL}/app.info.json",
+            timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("error") == "WRONG_AUTH_TYPE" or data.get("error") == "expired_token":
+                problems.append("❌ Bitrix24: вебхук истёк или не оплачен")
+            else:
+                print("✅ Bitrix24: OK")
+        elif resp.status_code == 401:
+            problems.append("❌ Bitrix24: вебхук не авторизован или истёк")
+        else:
+            problems.append(f"❌ Bitrix24: статус {resp.status_code}")
+    except Exception as e:
+        problems.append(f"❌ Bitrix24: ошибка соединения — {str(e)[:100]}")
+
+    return problems
+
+
+# ─────────────────────────────────────────────
 # Утилиты
 # ─────────────────────────────────────────────
 
@@ -282,31 +344,14 @@ def init_sheets():
                 "Описание", "Приход", "Расход", "Категория",
                 "Личное/Бизнес", "Статус"]]
 
-    # Проверяем первую строку
-    result = service.spreadsheets().values().get(
-        spreadsheetId=SHEET_ID, range="Транзакции!A1:H1"
+    # Всегда перезаписываем заголовки в строке 1
+    service.spreadsheets().values().update(
+        spreadsheetId=SHEET_ID,
+        range="Транзакции!A1",
+        valueInputOption="RAW",
+        body={"values": headers}
     ).execute()
-    first_row = result.get("values", [[]])[0] if result.get("values") else []
-
-    if first_row != headers[0]:
-        # Вставляем новую строку сверху
-        service.spreadsheets().batchUpdate(
-            spreadsheetId=SHEET_ID,
-            body={"requests": [{"insertDimension": {
-                "range": {"sheetId": 0, "dimension": "ROWS", "startIndex": 0, "endIndex": 1},
-                "inheritFromBefore": False
-            }}]}
-        ).execute()
-        # Пишем заголовки
-        service.spreadsheets().values().update(
-            spreadsheetId=SHEET_ID,
-            range="Транзакции!A1",
-            valueInputOption="RAW",
-            body={"values": headers}
-        ).execute()
-        print("Заголовки добавлены")
-    else:
-        print("Заголовки уже есть")
+    print("Заголовки обновлены")
 
     # Заголовок Правила — принудительно перезаписываем только заголовок
     service.spreadsheets().values().update(
@@ -713,6 +758,14 @@ def extract_transactions(pdf_bytes):
 
 def process_pdf_async(dialog_id, file_id, fallback_url):
     try:
+        # Проверяем все сервисы перед обработкой
+        problems = check_all_services()
+        if problems:
+            msg = "⚠️ Обнаружены проблемы с сервисами:\n\n" + "\n".join(problems)
+            msg += "\n\nПожалуйста проверьте оплату и настройки."
+            send_message(dialog_id, msg)
+            return
+
         pdf_bytes = get_pdf_bytes(file_id, fallback_url=fallback_url)
         send_message(dialog_id, "🔍 Анализирую выписку через ИИ...")
 
@@ -801,6 +854,17 @@ def bot_handler():
         send_message(dialog_id, "Пришли PDF-выписку из банка.")
 
     return jsonify({"result": "ok"})
+
+
+@app.route("/check", methods=["GET"])
+def check_services_route():
+    try:
+        problems = check_all_services()
+        if problems:
+            return jsonify({"ok": False, "problems": problems})
+        return jsonify({"ok": True, "message": "Все сервисы работают ✅"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
 
 
 @app.route("/health", methods=["GET"])
