@@ -1,6 +1,7 @@
 import os
 import io
 import json
+import time
 import base64
 import threading
 import requests
@@ -555,7 +556,8 @@ def try_download(url, extra_headers=None):
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/pdf,*/*"}
     if extra_headers:
         headers.update(extra_headers)
-    resp = requests.get(url, headers=headers, timeout=60, allow_redirects=True)
+    # Увеличен таймаут с 60 до 120 секунд
+    resp = requests.get(url, headers=headers, timeout=120, allow_redirects=True)
     content_type = (resp.headers.get("Content-Type") or "").lower()
     content_len = len(resp.content)
     print(f"try_download status={resp.status_code} ct={content_type} size={content_len}")
@@ -576,10 +578,11 @@ def get_pdf_bytes(file_id, fallback_url=None):
     def try_via_webhook(webhook_url, label):
         """Получает свежий DOWNLOAD_URL и сразу скачивает файл."""
         try:
+            # Увеличен таймаут с 30 до 60 секунд
             resp = requests.get(
                 f"{webhook_url}/disk.file.get.json",
                 params={"id": file_id},
-                timeout=30,
+                timeout=60,
             )
             print(f"[{label}] disk.file.get status={resp.status_code}")
             if resp.status_code != 200:
@@ -602,12 +605,16 @@ def get_pdf_bytes(file_id, fallback_url=None):
     if result:
         return result
 
-    # Попытки 2-4: disk-вебхук (3 раза, каждый раз свежий URL)
-    for attempt in range(3):
-        print(f"disk webhook attempt {attempt + 1}/3")
+    # Попытки 2-6: disk-вебхук (5 раз, каждый раз свежий URL, пауза между попытками)
+    for attempt in range(5):
+        print(f"disk webhook attempt {attempt + 1}/5")
         result = try_via_webhook(BITRIX_DISK_WEBHOOK_URL, f"disk-{attempt+1}")
         if result:
             return result
+        # Пауза перед следующей попыткой (кроме последней)
+        if attempt < 4:
+            print(f"Waiting 3s before next attempt...")
+            time.sleep(3)
 
     # Fallback URL из payload
     if fallback_url:
