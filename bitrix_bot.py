@@ -278,13 +278,13 @@ def init_sheets():
         ).execute()
 
     # Заголовки Транзакции — вставляем принудительно в строку 1
-    headers = [["Дата загрузки", "Дата операции", "Время", "Дата обработки", "Код авторизации", "Месяц", "Контрагент",
+    headers = [["Дата загрузки", "Дата операции", "Время", "Код авторизации", "Месяц", "Контрагент",
                 "Описание", "Приход", "Расход", "Категория",
                 "Личное/Бизнес", "Статус"]]
 
     # Проверяем первую строку
     result = service.spreadsheets().values().get(
-        spreadsheetId=SHEET_ID, range="Транзакции!A1:I1"
+        spreadsheetId=SHEET_ID, range="Транзакции!A1:H1"
     ).execute()
     first_row = result.get("values", [[]])[0] if result.get("values") else []
 
@@ -424,8 +424,8 @@ def write_to_sheets(transactions):
             # Потом встроенные правила
             category, biz_type = apply_rules(counterparty, description, amount, t_type)
 
-        inc = f"{amount:,.2f}".replace(".", ",") if t_type == "in" else ""
-        exp = f"{amount:,.2f}".replace(".", ",") if t_type == "out" else ""
+        inc = amount if t_type == "in" else ""
+        exp = amount if t_type == "out" else ""
         status = "❓ Уточнить" if category == "❓ Уточнить" else "✅"
 
         if status == "❓ Уточнить":
@@ -459,15 +459,14 @@ def write_to_sheets(transactions):
             upload_date,
             date_str,
             t.get("time", ""),
-            t.get("processing_date", ""),
             auth_code,
             month_label,
             counterparty,
             description,
             inc,
             exp,
-            "=IFERROR(VLOOKUP(G" + str(current_row) + ";'Правила'!$A:$B;2;0);\"? Уточнить\")",
-            "=IFERROR(VLOOKUP(G" + str(current_row) + ";'Правила'!$A:$C;3;0);\"\")",
+            "=IFERROR(VLOOKUP(F" + str(current_row) + ";'Правила'!$A:$B;2;0);\"? Уточнить\")",
+            "=IFERROR(VLOOKUP(F" + str(current_row) + ";'Правила'!$A:$C;3;0);\"\")",
             status,
         ])
         current_row += 1
