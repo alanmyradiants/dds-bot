@@ -403,19 +403,45 @@ def save_new_rules(service, new_rules):
         print(f"save_new_rules error: {e}")
 
 
+def _column_letter(idx):
+    """0 → A, 1 → B, ... 26 → AA."""
+    letters = ""
+    n = idx
+    while True:
+        letters = chr(ord("A") + n % 26) + letters
+        n = n // 26 - 1
+        if n < 0:
+            break
+    return letters
+
+
 def get_existing_auth_codes(service):
-    """Загружает все существующие коды авторизации из таблицы."""
+    """Загружает все существующие коды авторизации из таблицы.
+
+    Столбец ищется по заголовку "Код авторизации" — это устойчиво к сдвигам
+    (например, когда добавили столбец "Кто загрузил").
+    """
     try:
+        header_resp = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range="Транзакции!1:1"
+        ).execute()
+        headers = (header_resp.get("values") or [[]])[0]
+        try:
+            col_idx = headers.index("Код авторизации")
+        except ValueError:
+            print("get_existing_auth_codes: заголовок 'Код авторизации' не найден")
+            return set()
+
+        col = _column_letter(col_idx)
         result = service.spreadsheets().values().get(
-            spreadsheetId=SHEET_ID, range="Транзакции!E:E"
+            spreadsheetId=SHEET_ID, range=f"Транзакции!{col}:{col}"
         ).execute()
         rows = result.get("values", [])
-        # Собираем все непустые коды (пропускаем заголовок)
         codes = set()
         for row in rows[1:]:
             if row and row[0] and str(row[0]).strip():
                 codes.add(str(row[0]).strip())
-        print(f"Существующих кодов авторизации: {len(codes)}")
+        print(f"Существующих кодов авторизации: {len(codes)} (столбец {col})")
         return codes
     except Exception as e:
         print(f"get_existing_auth_codes error: {e}")
