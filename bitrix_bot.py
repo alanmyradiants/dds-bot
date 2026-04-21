@@ -474,13 +474,16 @@ def get_existing_dedup_sets(service):
             return row[idx] if 0 <= idx < len(row) else ""
 
         for row in rows[1:]:
+            # Для каждой строки строим ОБА ключа (если возможно)
+            # — чтобы ловить дубли и когда одна выписка с кодом, а другая без
             code = str(cell(row, i_auth)).strip() if i_auth != -1 else ""
             if code:
                 auth_codes.add(code)
-                continue
-            date = cell(row, i_date)
-            cp   = cell(row, i_cp)
-            amt  = cell(row, i_in) or cell(row, i_out)
+            date = cell(row, i_date) if i_date != -1 else ""
+            cp   = cell(row, i_cp) if i_cp != -1 else ""
+            amt_in  = cell(row, i_in) if i_in != -1 else ""
+            amt_out = cell(row, i_out) if i_out != -1 else ""
+            amt = amt_in or amt_out
             if date and cp and str(amt).strip():
                 composite.add(_composite_key(date, cp, amt))
 
@@ -533,20 +536,24 @@ def write_to_sheets(transactions, uploader=""):
         auth_code = str(t.get("auth_code", "") or "").strip()
         date_str_raw = str(t.get("date", "") or "").strip()
 
-        # Дубль по коду авторизации
+        # Строим оба ключа для проверки дублей
+        composite_key = _composite_key(date_str_raw, counterparty, amount)
+        composite_valid = bool(composite_key[0] and composite_key[1] and composite_key[2])
+
+        # Дубль, если совпал хотя бы один ключ (код авторизации ИЛИ дата+контрагент+сумма)
+        is_duplicate = (
+            (auth_code and auth_code in existing_auth_codes)
+            or (composite_valid and composite_key in existing_composite)
+        )
+        if is_duplicate:
+            skipped += 1
+            continue
+
+        # Регистрируем оба ключа, чтобы ловить дубли внутри одной пачки
         if auth_code:
-            if auth_code in existing_auth_codes:
-                skipped += 1
-                continue
             existing_auth_codes.add(auth_code)
-        else:
-            # Фолбэк: дата + контрагент + сумма (для строк без auth_code)
-            key = _composite_key(date_str_raw, counterparty, amount)
-            if key[0] and key[1] and key[2]:
-                if key in existing_composite:
-                    skipped += 1
-                    continue
-                existing_composite.add(key)
+        if composite_valid:
+            existing_composite.add(composite_key)
 
         # Сначала смотрим правила из таблицы (точное совпадение контрагента)
         if counterparty_upper in sheet_rules:
@@ -631,13 +638,25 @@ def bitrix_post(method_name, payload, timeout=20):
 
 
 def extract_uploader_name(data):
-    """Определяет ФИО сотрудника, загрузившего файл."""
-    name = str(data.get("data[USER][NAME]") or "").strip()
-    last = str(data.get("data[USER][LAST_NAME]") or "").strip()
-    full = f"{name} {last}".strip()
-    if full:
-        return full
+    """Определяет ФИО сотрудника, загрузившего файл.
 
+    Вебхук Битрикса иногда шлёт только часть ФИО (например, NAME без LAST_NAME
+    или, наоборот, полное ФИО одним полем в NAME). Поэтому:
+      1) Если в вебхуке есть И имя, И фамилия — используем их.
+      2) Иначе лезем в user.get за каноничным ФИО.
+      3) Если API недоступен — возвращаем то, что есть в вебхуке.
+    """
+    first = (
+        str(data.get("data[USER][FIRST_NAME]") or "").strip()
+        or str(data.get("data[USER][NAME]") or "").strip()
+    )
+    last = str(data.get("data[USER][LAST_NAME]") or "").strip()
+
+    # Если в вебхуке уже полное ФИО — не дергаем API
+    if first and last:
+        return f"{first} {last}"
+
+    # Иначе идём в user.get
     user_id = (
         data.get("data[USER][ID]")
         or data.get("data[PARAMS][FROM_USER_ID]")
@@ -652,13 +671,15 @@ def extract_uploader_name(data):
                     u = result[0]
                     n = (u.get("NAME") or "").strip()
                     l = (u.get("LAST_NAME") or "").strip()
-                    full = f"{n} {l}".strip()
-                    if full:
-                        return full
+                    full_api = f"{n} {l}".strip()
+                    if full_api:
+                        return full_api
         except Exception as e:
             print(f"extract_uploader_name error: {e}")
 
-    return "Неизвестно"
+    # Фолбэк: то, что было в вебхуке
+    fallback = f"{first} {last}".strip()
+    return fallback if fallback else "Неизвестно"
 
 
 def send_message(dialog_id, text):
