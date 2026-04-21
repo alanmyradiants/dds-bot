@@ -637,26 +637,47 @@ def bitrix_post(method_name, payload, timeout=20):
     return response
 
 
+def _combine_first_last(first, last):
+    """Объединяет имя и фамилию, избегая дублирования.
+
+    Битрикс иногда шлёт NAME="Алан Мурадянц" (уже с фамилией)
+    И отдельно LAST_NAME="Мурадянц" — простое склеивание дало бы
+    "Алан Мурадянц Мурадянц". Эта функция ловит такой случай.
+    """
+    first = (first or "").strip()
+    last = (last or "").strip()
+    if not first:
+        return last
+    if not last:
+        return first
+    # Если фамилия уже есть в first как отдельное слово — не дублируем
+    first_words_lower = [w.lower() for w in first.split()]
+    if last.lower() in first_words_lower:
+        return first
+    return f"{first} {last}"
+
+
 def extract_uploader_name(data):
     """Определяет ФИО сотрудника, загрузившего файл.
 
-    Вебхук Битрикса иногда шлёт только часть ФИО (например, NAME без LAST_NAME
-    или, наоборот, полное ФИО одним полем в NAME). Поэтому:
-      1) Если в вебхуке есть И имя, И фамилия — используем их.
-      2) Иначе лезем в user.get за каноничным ФИО.
-      3) Если API недоступен — возвращаем то, что есть в вебхуке.
+    Битрикс непредсказуем в том, что кладёт в NAME:
+      — иногда только имя ("Алан"),
+      — иногда полное ФИО ("Алан Мурадянц").
+    Поэтому объединяем через _combine_first_last, чтобы не получить
+    "Алан Мурадянц Мурадянц", и при необходимости добираем ФИО из user.get.
     """
-    first = (
-        str(data.get("data[USER][FIRST_NAME]") or "").strip()
-        or str(data.get("data[USER][NAME]") or "").strip()
-    )
-    last = str(data.get("data[USER][LAST_NAME]") or "").strip()
+    first_name = str(data.get("data[USER][FIRST_NAME]") or "").strip()
+    name_field = str(data.get("data[USER][NAME]") or "").strip()
+    last_name  = str(data.get("data[USER][LAST_NAME]") or "").strip()
 
-    # Если в вебхуке уже полное ФИО — не дергаем API
-    if first and last:
-        return f"{first} {last}"
+    # FIRST_NAME приоритетнее NAME (в NAME может быть уже ФИО целиком)
+    first = first_name or name_field
 
-    # Иначе идём в user.get
+    # Если в вебхуке есть и имя, и фамилия — склеиваем аккуратно и отдаём
+    if first and last_name:
+        return _combine_first_last(first, last_name)
+
+    # Иначе идём в user.get за каноничным ФИО
     user_id = (
         data.get("data[USER][ID]")
         or data.get("data[PARAMS][FROM_USER_ID]")
@@ -671,14 +692,14 @@ def extract_uploader_name(data):
                     u = result[0]
                     n = (u.get("NAME") or "").strip()
                     l = (u.get("LAST_NAME") or "").strip()
-                    full_api = f"{n} {l}".strip()
-                    if full_api:
-                        return full_api
+                    combined = _combine_first_last(n, l)
+                    if combined:
+                        return combined
         except Exception as e:
             print(f"extract_uploader_name error: {e}")
 
-    # Фолбэк: то, что было в вебхуке
-    fallback = f"{first} {last}".strip()
+    # Фолбэк — то, что было в вебхуке
+    fallback = _combine_first_last(first, last_name)
     return fallback if fallback else "Неизвестно"
 
 
