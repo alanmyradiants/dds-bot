@@ -340,7 +340,7 @@ def init_sheets():
         ).execute()
 
     # Заголовки Транзакции — вставляем принудительно в строку 1
-    headers = [["Дата загрузки", "Дата операции", "Время", "Код авторизации", "Месяц", "Контрагент",
+    headers = [["Дата загрузки", "Кто загрузил", "Дата операции", "Время", "Код авторизации", "Месяц", "Контрагент",
                 "Описание", "Приход", "Расход", "Категория",
                 "Личное/Бизнес", "Статус"]]
 
@@ -403,26 +403,101 @@ def save_new_rules(service, new_rules):
         print(f"save_new_rules error: {e}")
 
 
-def get_existing_auth_codes(service):
-    """Загружает все существующие коды авторизации из таблицы."""
+def _column_letter(idx):
+    """0 → A, 1 → B, ... 26 → AA."""
+    letters = ""
+    n = idx
+    while True:
+        letters = chr(ord("A") + n % 26) + letters
+        n = n // 26 - 1
+        if n < 0:
+            break
+    return letters
+
+
+def _normalize_amount(value):
+    """Приводит сумму к виду '1234.56' (убирает пробелы, запятые, лишние нули)."""
+    s = str(value or "").replace("\xa0", "").replace(" ", "").replace(",", ".").strip()
+    if not s:
+        return ""
     try:
+        return f"{float(s):.2f}"
+    except ValueError:
+        return s
+
+
+def _composite_key(date, counterparty, amount):
+    """Ключ для дедупа транзакций без auth_code."""
+    return (
+        str(date or "").strip(),
+        str(counterparty or "").upper().strip(),
+        _normalize_amount(amount),
+    )
+
+
+def get_existing_dedup_sets(service):
+    """Читает таблицу и возвращает два набора для проверки дублей:
+      1) set кодов авторизации;
+      2) set композитных ключей (дата, контрагент, сумма) — для строк без кода.
+    Столбцы ищутся по именам заголовков, чтобы порядок колонок не ломал логику.
+    """
+    auth_codes = set()
+    composite = set()
+    try:
+        header_resp = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range="Транзакции!1:1"
+        ).execute()
+        headers = (header_resp.get("values") or [[]])[0]
+
+        def idx_of(name):
+            try:
+                return headers.index(name)
+            except ValueError:
+                return -1
+
+        i_auth  = idx_of("Код авторизации")
+        i_date  = idx_of("Дата операции")
+        i_cp    = idx_of("Контрагент")
+        i_in    = idx_of("Приход")
+        i_out   = idx_of("Расход")
+
+        if i_auth == -1 and (i_date == -1 or i_cp == -1 or (i_in == -1 and i_out == -1)):
+            print("get_existing_dedup_sets: нужные заголовки не найдены")
+            return auth_codes, composite
+
         result = service.spreadsheets().values().get(
-            spreadsheetId=SHEET_ID, range="Транзакции!E:E"
+            spreadsheetId=SHEET_ID, range="Транзакции!A:Z"
         ).execute()
         rows = result.get("values", [])
-        # Собираем все непустые коды (пропускаем заголовок)
-        codes = set()
+
+        def cell(row, idx):
+            return row[idx] if 0 <= idx < len(row) else ""
+
         for row in rows[1:]:
-            if row and row[0] and str(row[0]).strip():
-                codes.add(str(row[0]).strip())
-        print(f"Существующих кодов авторизации: {len(codes)}")
-        return codes
+            code = str(cell(row, i_auth)).strip() if i_auth != -1 else ""
+            if code:
+                auth_codes.add(code)
+                continue
+            date = cell(row, i_date)
+            cp   = cell(row, i_cp)
+            amt  = cell(row, i_in) or cell(row, i_out)
+            if date and cp and str(amt).strip():
+                composite.add(_composite_key(date, cp, amt))
+
+        print(f"Дедуп: auth_codes={len(auth_codes)}, composite={len(composite)}")
+        return auth_codes, composite
     except Exception as e:
-        print(f"get_existing_auth_codes error: {e}")
-        return set()
+        print(f"get_existing_dedup_sets error: {e}")
+        return auth_codes, composite
 
 
-def write_to_sheets(transactions):
+def get_existing_auth_codes(service):
+    """Совместимость со старым кодом — возвращает только auth_codes."""
+    auth_codes, _ = get_existing_dedup_sets(service)
+    return auth_codes
+
+
+def write_to_sheets(transactions, uploader=""):
     """Записывает транзакции в Google Sheets."""
     service = get_sheets_service()
     from datetime import timezone, timedelta
@@ -432,8 +507,8 @@ def write_to_sheets(transactions):
     # Загружаем существующие правила из таблицы
     sheet_rules = get_existing_rules(service)
 
-    # Загружаем существующие коды авторизации (защита от дублей)
-    existing_auth_codes = get_existing_auth_codes(service)
+    # Загружаем существующие ключи дедупа: коды авторизации + (дата, контрагент, сумма)
+    existing_auth_codes, existing_composite = get_existing_dedup_sets(service)
 
     rows = []
     clarify_list = []
@@ -456,11 +531,22 @@ def write_to_sheets(transactions):
         description = t.get("description", "")
         counterparty_upper = counterparty.upper().strip()
         auth_code = str(t.get("auth_code", "") or "").strip()
+        date_str_raw = str(t.get("date", "") or "").strip()
 
-        # Проверяем дубль по коду авторизации
-        if auth_code and auth_code in existing_auth_codes:
-            skipped += 1
-            continue
+        # Дубль по коду авторизации
+        if auth_code:
+            if auth_code in existing_auth_codes:
+                skipped += 1
+                continue
+            existing_auth_codes.add(auth_code)
+        else:
+            # Фолбэк: дата + контрагент + сумма (для строк без auth_code)
+            key = _composite_key(date_str_raw, counterparty, amount)
+            if key[0] and key[1] and key[2]:
+                if key in existing_composite:
+                    skipped += 1
+                    continue
+                existing_composite.add(key)
 
         # Сначала смотрим правила из таблицы (точное совпадение контрагента)
         if counterparty_upper in sheet_rules:
@@ -502,6 +588,7 @@ def write_to_sheets(transactions):
 
         rows.append([
             upload_date,
+            uploader,
             date_str,
             t.get("time", ""),
             auth_code,
@@ -510,8 +597,8 @@ def write_to_sheets(transactions):
             description,
             inc,
             exp,
-            "=IFERROR(VLOOKUP(F" + str(current_row) + ";'Правила'!$A:$B;2;0);\"? Уточнить\")",
-            "=IFERROR(VLOOKUP(F" + str(current_row) + ";'Правила'!$A:$C;3;0);\"\")",
+            "=IFERROR(VLOOKUP(G" + str(current_row) + ";'Правила'!$A:$B;2;0);\"? Уточнить\")",
+            "=IFERROR(VLOOKUP(G" + str(current_row) + ";'Правила'!$A:$C;3;0);\"\")",
             status,
         ])
         current_row += 1
@@ -541,6 +628,37 @@ def bitrix_post(method_name, payload, timeout=20):
     response = requests.post(url, json=payload, timeout=timeout)
     print(f"{method_name} POST status={response.status_code}")
     return response
+
+
+def extract_uploader_name(data):
+    """Определяет ФИО сотрудника, загрузившего файл."""
+    name = str(data.get("data[USER][NAME]") or "").strip()
+    last = str(data.get("data[USER][LAST_NAME]") or "").strip()
+    full = f"{name} {last}".strip()
+    if full:
+        return full
+
+    user_id = (
+        data.get("data[USER][ID]")
+        or data.get("data[PARAMS][FROM_USER_ID]")
+        or data.get("auth[user_id]")
+    )
+    if user_id:
+        try:
+            resp = bitrix_post("user.get", {"ID": user_id}, timeout=10)
+            if resp.status_code == 200:
+                result = resp.json().get("result") or []
+                if result:
+                    u = result[0]
+                    n = (u.get("NAME") or "").strip()
+                    l = (u.get("LAST_NAME") or "").strip()
+                    full = f"{n} {l}".strip()
+                    if full:
+                        return full
+        except Exception as e:
+            print(f"extract_uploader_name error: {e}")
+
+    return "Неизвестно"
 
 
 def send_message(dialog_id, text):
@@ -756,7 +874,7 @@ def extract_transactions(pdf_bytes):
 # Фоновая обработка
 # ─────────────────────────────────────────────
 
-def process_pdf_async(dialog_id, file_id, fallback_url):
+def process_pdf_async(dialog_id, file_id, fallback_url, uploader=""):
     try:
         # Проверяем все сервисы перед обработкой
         problems = check_all_services()
@@ -775,7 +893,7 @@ def process_pdf_async(dialog_id, file_id, fallback_url):
         total_out = sum(float(t.get("amount", 0) or 0) for t in transactions if t.get("type") == "out")
 
         send_message(dialog_id, "📊 Записываю в таблицу...")
-        clarify_list, skipped = write_to_sheets(transactions)
+        clarify_list, skipped = write_to_sheets(transactions, uploader=uploader)
 
         skipped_text = f"\n⚠️ Пропущено дублей: {skipped}" if skipped > 0 else ""
         # Основное сообщение
@@ -836,10 +954,11 @@ def bot_handler():
     fallback_url = file_info.get("url_download")
 
     if filename.lower().endswith(".pdf") and file_id:
+        uploader = extract_uploader_name(data)
         send_message(dialog_id, "📄 Получил PDF, начинаю обработку...")
         thread = threading.Thread(
             target=process_pdf_async,
-            args=(dialog_id, file_id, fallback_url),
+            args=(dialog_id, file_id, fallback_url, uploader),
             daemon=True,
         )
         thread.start()
