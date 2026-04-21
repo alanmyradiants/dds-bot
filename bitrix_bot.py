@@ -340,7 +340,7 @@ def init_sheets():
         ).execute()
 
     # Заголовки Транзакции — вставляем принудительно в строку 1
-    headers = [["Дата загрузки", "Дата операции", "Время", "Код авторизации", "Месяц", "Контрагент",
+    headers = [["Дата загрузки", "Кто загрузил", "Дата операции", "Время", "Код авторизации", "Месяц", "Контрагент",
                 "Описание", "Приход", "Расход", "Категория",
                 "Личное/Бизнес", "Статус"]]
 
@@ -422,7 +422,7 @@ def get_existing_auth_codes(service):
         return set()
 
 
-def write_to_sheets(transactions):
+def write_to_sheets(transactions, uploader=""):
     """Записывает транзакции в Google Sheets."""
     service = get_sheets_service()
     from datetime import timezone, timedelta
@@ -502,6 +502,7 @@ def write_to_sheets(transactions):
 
         rows.append([
             upload_date,
+            uploader,
             date_str,
             t.get("time", ""),
             auth_code,
@@ -510,8 +511,8 @@ def write_to_sheets(transactions):
             description,
             inc,
             exp,
-            "=IFERROR(VLOOKUP(F" + str(current_row) + ";'Правила'!$A:$B;2;0);\"? Уточнить\")",
-            "=IFERROR(VLOOKUP(F" + str(current_row) + ";'Правила'!$A:$C;3;0);\"\")",
+            "=IFERROR(VLOOKUP(G" + str(current_row) + ";'Правила'!$A:$B;2;0);\"? Уточнить\")",
+            "=IFERROR(VLOOKUP(G" + str(current_row) + ";'Правила'!$A:$C;3;0);\"\")",
             status,
         ])
         current_row += 1
@@ -541,6 +542,37 @@ def bitrix_post(method_name, payload, timeout=20):
     response = requests.post(url, json=payload, timeout=timeout)
     print(f"{method_name} POST status={response.status_code}")
     return response
+
+
+def extract_uploader_name(data):
+    """Определяет ФИО сотрудника, загрузившего файл."""
+    name = str(data.get("data[USER][NAME]") or "").strip()
+    last = str(data.get("data[USER][LAST_NAME]") or "").strip()
+    full = f"{name} {last}".strip()
+    if full:
+        return full
+
+    user_id = (
+        data.get("data[USER][ID]")
+        or data.get("data[PARAMS][FROM_USER_ID]")
+        or data.get("auth[user_id]")
+    )
+    if user_id:
+        try:
+            resp = bitrix_post("user.get", {"ID": user_id}, timeout=10)
+            if resp.status_code == 200:
+                result = resp.json().get("result") or []
+                if result:
+                    u = result[0]
+                    n = (u.get("NAME") or "").strip()
+                    l = (u.get("LAST_NAME") or "").strip()
+                    full = f"{n} {l}".strip()
+                    if full:
+                        return full
+        except Exception as e:
+            print(f"extract_uploader_name error: {e}")
+
+    return "Неизвестно"
 
 
 def send_message(dialog_id, text):
@@ -756,7 +788,7 @@ def extract_transactions(pdf_bytes):
 # Фоновая обработка
 # ─────────────────────────────────────────────
 
-def process_pdf_async(dialog_id, file_id, fallback_url):
+def process_pdf_async(dialog_id, file_id, fallback_url, uploader=""):
     try:
         # Проверяем все сервисы перед обработкой
         problems = check_all_services()
@@ -775,7 +807,7 @@ def process_pdf_async(dialog_id, file_id, fallback_url):
         total_out = sum(float(t.get("amount", 0) or 0) for t in transactions if t.get("type") == "out")
 
         send_message(dialog_id, "📊 Записываю в таблицу...")
-        clarify_list, skipped = write_to_sheets(transactions)
+        clarify_list, skipped = write_to_sheets(transactions, uploader=uploader)
 
         skipped_text = f"\n⚠️ Пропущено дублей: {skipped}" if skipped > 0 else ""
         # Основное сообщение
@@ -836,10 +868,11 @@ def bot_handler():
     fallback_url = file_info.get("url_download")
 
     if filename.lower().endswith(".pdf") and file_id:
+        uploader = extract_uploader_name(data)
         send_message(dialog_id, "📄 Получил PDF, начинаю обработку...")
         thread = threading.Thread(
             target=process_pdf_async,
-            args=(dialog_id, file_id, fallback_url),
+            args=(dialog_id, file_id, fallback_url, uploader),
             daemon=True,
         )
         thread.start()
