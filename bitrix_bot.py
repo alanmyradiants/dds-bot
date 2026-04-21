@@ -415,37 +415,86 @@ def _column_letter(idx):
     return letters
 
 
-def get_existing_auth_codes(service):
-    """Загружает все существующие коды авторизации из таблицы.
+def _normalize_amount(value):
+    """Приводит сумму к виду '1234.56' (убирает пробелы, запятые, лишние нули)."""
+    s = str(value or "").replace("\xa0", "").replace(" ", "").replace(",", ".").strip()
+    if not s:
+        return ""
+    try:
+        return f"{float(s):.2f}"
+    except ValueError:
+        return s
 
-    Столбец ищется по заголовку "Код авторизации" — это устойчиво к сдвигам
-    (например, когда добавили столбец "Кто загрузил").
+
+def _composite_key(date, counterparty, amount):
+    """Ключ для дедупа транзакций без auth_code."""
+    return (
+        str(date or "").strip(),
+        str(counterparty or "").upper().strip(),
+        _normalize_amount(amount),
+    )
+
+
+def get_existing_dedup_sets(service):
+    """Читает таблицу и возвращает два набора для проверки дублей:
+      1) set кодов авторизации;
+      2) set композитных ключей (дата, контрагент, сумма) — для строк без кода.
+    Столбцы ищутся по именам заголовков, чтобы порядок колонок не ломал логику.
     """
+    auth_codes = set()
+    composite = set()
     try:
         header_resp = service.spreadsheets().values().get(
             spreadsheetId=SHEET_ID, range="Транзакции!1:1"
         ).execute()
         headers = (header_resp.get("values") or [[]])[0]
-        try:
-            col_idx = headers.index("Код авторизации")
-        except ValueError:
-            print("get_existing_auth_codes: заголовок 'Код авторизации' не найден")
-            return set()
 
-        col = _column_letter(col_idx)
+        def idx_of(name):
+            try:
+                return headers.index(name)
+            except ValueError:
+                return -1
+
+        i_auth  = idx_of("Код авторизации")
+        i_date  = idx_of("Дата операции")
+        i_cp    = idx_of("Контрагент")
+        i_in    = idx_of("Приход")
+        i_out   = idx_of("Расход")
+
+        if i_auth == -1 and (i_date == -1 or i_cp == -1 or (i_in == -1 and i_out == -1)):
+            print("get_existing_dedup_sets: нужные заголовки не найдены")
+            return auth_codes, composite
+
         result = service.spreadsheets().values().get(
-            spreadsheetId=SHEET_ID, range=f"Транзакции!{col}:{col}"
+            spreadsheetId=SHEET_ID, range="Транзакции!A:Z"
         ).execute()
         rows = result.get("values", [])
-        codes = set()
+
+        def cell(row, idx):
+            return row[idx] if 0 <= idx < len(row) else ""
+
         for row in rows[1:]:
-            if row and row[0] and str(row[0]).strip():
-                codes.add(str(row[0]).strip())
-        print(f"Существующих кодов авторизации: {len(codes)} (столбец {col})")
-        return codes
+            code = str(cell(row, i_auth)).strip() if i_auth != -1 else ""
+            if code:
+                auth_codes.add(code)
+                continue
+            date = cell(row, i_date)
+            cp   = cell(row, i_cp)
+            amt  = cell(row, i_in) or cell(row, i_out)
+            if date and cp and str(amt).strip():
+                composite.add(_composite_key(date, cp, amt))
+
+        print(f"Дедуп: auth_codes={len(auth_codes)}, composite={len(composite)}")
+        return auth_codes, composite
     except Exception as e:
-        print(f"get_existing_auth_codes error: {e}")
-        return set()
+        print(f"get_existing_dedup_sets error: {e}")
+        return auth_codes, composite
+
+
+def get_existing_auth_codes(service):
+    """Совместимость со старым кодом — возвращает только auth_codes."""
+    auth_codes, _ = get_existing_dedup_sets(service)
+    return auth_codes
 
 
 def write_to_sheets(transactions, uploader=""):
@@ -458,8 +507,8 @@ def write_to_sheets(transactions, uploader=""):
     # Загружаем существующие правила из таблицы
     sheet_rules = get_existing_rules(service)
 
-    # Загружаем существующие коды авторизации (защита от дублей)
-    existing_auth_codes = get_existing_auth_codes(service)
+    # Загружаем существующие ключи дедупа: коды авторизации + (дата, контрагент, сумма)
+    existing_auth_codes, existing_composite = get_existing_dedup_sets(service)
 
     rows = []
     clarify_list = []
@@ -482,11 +531,22 @@ def write_to_sheets(transactions, uploader=""):
         description = t.get("description", "")
         counterparty_upper = counterparty.upper().strip()
         auth_code = str(t.get("auth_code", "") or "").strip()
+        date_str_raw = str(t.get("date", "") or "").strip()
 
-        # Проверяем дубль по коду авторизации
-        if auth_code and auth_code in existing_auth_codes:
-            skipped += 1
-            continue
+        # Дубль по коду авторизации
+        if auth_code:
+            if auth_code in existing_auth_codes:
+                skipped += 1
+                continue
+            existing_auth_codes.add(auth_code)
+        else:
+            # Фолбэк: дата + контрагент + сумма (для строк без auth_code)
+            key = _composite_key(date_str_raw, counterparty, amount)
+            if key[0] and key[1] and key[2]:
+                if key in existing_composite:
+                    skipped += 1
+                    continue
+                existing_composite.add(key)
 
         # Сначала смотрим правила из таблицы (точное совпадение контрагента)
         if counterparty_upper in sheet_rules:
