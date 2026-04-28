@@ -358,22 +358,34 @@ def parse_request_data():
 def parse_auth_from_event(data):
     """Извлекает auth-данные из входящего события Bitrix.
 
-    В каждом событии бот-приложения Битрикс шлёт блок auth[…] — токен и
-    эндпоинт того портала и того ПОЛЬЗОВАТЕЛЯ, который инициировал событие
-    (например, отправил PDF в чат). Если использовать этот access_token
-    для последующих REST-запросов, они идут от имени этого пользователя —
-    у него точно есть доступ к собственным файлам, в отличие от
-    статического вебхука с зашитым user_id.
+    Битрикс присылает auth-блок в одном из двух форматов:
+      1) form-encoded с bracket notation (так шлются чат-события):
+         "auth[access_token]" = "..."
+      2) JSON с вложенным объектом (так часто шлётся ONAPPINSTALL):
+         {"auth": {"access_token": "..."}}
+
+    Сначала пробуем bracket notation, потом nested dict — берём первое
+    непустое значение для каждого поля.
 
     Возвращает dict с возможными ключами: access_token, application_token,
-    domain, client_endpoint. Любой из них может быть пустой строкой.
+    domain, client_endpoint, refresh_token. Любой из них может быть пустой
+    строкой, если Битрикс его не прислал (например, для inbound webhook
+    бота access_token отсутствует в принципе).
     """
-    return {
-        "access_token":      str(data.get("auth[access_token]") or "").strip(),
-        "application_token": str(data.get("auth[application_token]") or "").strip(),
-        "domain":            str(data.get("auth[domain]") or "").strip(),
-        "client_endpoint":   str(data.get("auth[client_endpoint]") or "").strip(),
-    }
+    fields = ("access_token", "application_token", "domain",
+              "client_endpoint", "refresh_token")
+
+    # Формат 1: bracket notation
+    result = {f: str(data.get(f"auth[{f}]") or "").strip() for f in fields}
+
+    # Формат 2: nested dict — заполняем только пустые поля, не затирая
+    auth_obj = data.get("auth")
+    if isinstance(auth_obj, dict):
+        for f in fields:
+            if not result[f]:
+                result[f] = str(auth_obj.get(f) or "").strip()
+
+    return result
 
 
 def apply_rules(counterparty, description, amount, t_type):
@@ -1270,12 +1282,20 @@ def install_handler():
     последующие чат-события на /bot будут содержать auth[access_token]
     отправителя сообщения, и patch в get_pdf_bytes (см. PR #2) наконец
     сможет скачивать файлы.
+
+    Парсер auth понимает оба формата (bracket-notation и nested dict),
+    которые Битрикс может прислать в зависимости от Content-Type.
     """
     if request.method == "GET":
         return _render_install_page()
 
     data = parse_request_data()
     print("===== INSTALL EVENT =====")
+    print(f"Method: {request.method}, Content-Type: {request.content_type}")
+    top_keys = sorted(list(data.keys()))[:30]
+    print(f"Top-level keys ({len(data)}): {top_keys}")
+    auth_obj_type = type(data.get("auth")).__name__
+    print(f"data['auth'] type: {auth_obj_type}")
     print(safe_preview(data, 5000))
 
     auth = parse_auth_from_event(data)
@@ -1283,8 +1303,16 @@ def install_handler():
     client_endpoint = auth.get("client_endpoint")
 
     if not access_token or not client_endpoint:
-        msg = ("Битрикс не прислал access_token или client_endpoint в событии установки. "
-               "Проверь, что приложение зарегистрировано как Серверное и имеет права imbot/im/disk.")
+        # Собираем диагностику в саму ошибку — чтобы можно было увидеть
+        # на странице установки без лазания по логам Railway.
+        found_auth = {k: ("set" if v else "empty") for k, v in auth.items()}
+        msg = (
+            "Битрикс не прислал access_token или client_endpoint. "
+            f"Что распарсилось из auth: {found_auth}. "
+            f"Top-level ключи payload: {top_keys}. "
+            f"data['auth'] был типа: {auth_obj_type}. "
+            "Скопируй этот текст и пришли мне — без него дальше копать сложно."
+        )
         print(f"INSTALL ERROR: {msg}")
         return _render_install_page(error=msg), 400
 
