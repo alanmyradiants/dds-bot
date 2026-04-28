@@ -1,0 +1,83 @@
+name: Notify Bitrix on Release
+
+# Срабатывает ТОЛЬКО когда ты пушишь git-тег вида v1.2.3
+# Промежуточные коммиты, билды и деплои канал не трогают.
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build changelog
+        id: changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_NAME="${GITHUB_REF_NAME}"
+          BOT_NAME="${{ github.event.repository.name }}"
+
+          ANNOTATION=$(git tag -l --format='%(contents)' "$TAG_NAME" | sed -e 's/-----BEGIN PGP SIGNATURE-----.*$//' | awk 'NF{found=1} found')
+
+          if [ -n "$ANNOTATION" ]; then
+            CHANGES="$ANNOTATION"
+          else
+            PREV_TAG=$(git describe --tags --abbrev=0 "${TAG_NAME}^" 2>/dev/null || echo "")
+            if [ -n "$PREV_TAG" ]; then
+              CHANGES=$(git log "${PREV_TAG}..${TAG_NAME}" --pretty=format:'• %s' --no-merges)
+            else
+              CHANGES=$(git log "${TAG_NAME}" --pretty=format:'• %s' --no-merges -n 20)
+            fi
+          fi
+
+          if [ -z "$CHANGES" ]; then
+            CHANGES="• релиз без описания"
+          fi
+
+          {
+            echo "tag=${TAG_NAME}"
+            echo "bot=${BOT_NAME}"
+            echo "changes<<EOF"
+            echo "$CHANGES"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Send Bitrix notification
+        env:
+          BITRIX_WEBHOOK_URL: ${{ secrets.BITRIX_WEBHOOK_URL }}
+          BITRIX_DIALOG_ID: ${{ vars.BITRIX_DIALOG_ID }}
+          BOT: ${{ steps.changelog.outputs.bot }}
+          TAG: ${{ steps.changelog.outputs.tag }}
+          CHANGES: ${{ steps.changelog.outputs.changes }}
+          ACTOR: ${{ github.actor }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${BITRIX_WEBHOOK_URL:-}" ]; then
+            echo "::error::Secret BITRIX_WEBHOOK_URL не задан в Settings → Secrets and variables → Actions"
+            exit 1
+          fi
+
+          DIALOG="${BITRIX_DIALOG_ID:-chat8284}"
+          DATE=$(date +%d.%m.%Y)
+          MSG=$(printf '[B]🤖 Обновление бота: %s[/B]\nВерсия: %s · %s\nАвтор: %s\n\nЧто нового:\n%s' "$BOT" "$TAG" "$DATE" "$ACTOR" "$CHANGES")
+
+          PAYLOAD=$(jq -n --arg dlg "$DIALOG" --arg msg "$MSG" '{DIALOG_ID:$dlg, MESSAGE:$msg}')
+          URL="${BITRIX_WEBHOOK_URL%/}/im.message.add.json"
+
+          RESP=$(curl -sS -X POST -H 'Content-Type: application/json' -d "$PAYLOAD" "$URL")
+          echo "Bitrix response: $RESP"
+
+          if echo "$RESP" | jq -e '.error' >/dev/null 2>&1; then
+            echo "::error::Bitrix API вернул ошибку"
+            exit 1
+          fi
