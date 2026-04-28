@@ -7,7 +7,7 @@ import threading
 import requests
 from datetime import datetime
 from urllib.parse import parse_qs
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 import anthropic
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -20,6 +20,13 @@ BITRIX_WEBHOOK_URL      = os.getenv("BITRIX_WEBHOOK_URL", "https://joto.bitrix24
 BITRIX_DISK_WEBHOOK_URL = os.getenv("BITRIX_DISK_WEBHOOK_URL", "https://joto.bitrix24.ru/rest/1/g4s7w21uysosjds7").rstrip("/")
 BOT_CLIENT_ID           = os.getenv("BOT_CLIENT_ID", "glhjxdm0jwb216zd3kdau2mwtf4z0fbu")
 SHEET_ID                = "1i7a-UaUzzTJ5kVI5U18_fE6hkYb_i1uK0Fw_FTFhuNs"
+
+# Параметры Local Application в Битриксе (нужны для OAuth-флоу).
+# CLIENT_ID — публичный, можно положить значение по умолчанию.
+# CLIENT_SECRET — секретный, обязательно через Railway env.
+BITRIX_APP_CLIENT_ID     = os.getenv("BITRIX_APP_CLIENT_ID", "").strip()
+BITRIX_APP_CLIENT_SECRET = os.getenv("BITRIX_APP_CLIENT_SECRET", "").strip()
+APP_PUBLIC_URL           = os.getenv("APP_PUBLIC_URL", "https://dds-bot-production.up.railway.app").rstrip("/")
 
 DISK_TOKEN = BITRIX_DISK_WEBHOOK_URL.rstrip("/").split("/")[-1]
 SHEET_URL  = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
@@ -1164,7 +1171,6 @@ def health():
 @app.route("/help-text", methods=["GET"])
 def help_text_route():
     """Возвращает текущий HELP_TEXT для дебага/превью."""
-    from flask import Response
     return Response(build_help_text(), mimetype="text/plain; charset=utf-8")
 
 
@@ -1175,6 +1181,120 @@ def init_sheets_route():
         return jsonify({"ok": True, "message": "Таблица инициализирована"})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
+
+
+# ─────────────────────────────────────────────
+# OAuth Local App — установка приложения
+# ─────────────────────────────────────────────
+
+def _render_install_page(bot_id=None, error=None):
+    """Простая HTML-страница, которую видит пользователь после установки."""
+    if error:
+        body = f"""
+        <h2 style="color:#dc3545;">❌ Ошибка установки</h2>
+        <p>{error}</p>
+        <p style="color:#666;font-size:14px;">Если ошибка не очевидна — посмотри логи Railway за последнюю минуту.</p>
+        """
+    elif bot_id:
+        body = f"""
+        <h2 style="color:#28a745;">✅ ДДС-бот установлен!</h2>
+        <p><b>BOT_ID:</b> <code>{bot_id}</code></p>
+        <p>⚠️ <b>Важно:</b> обнови переменную окружения <code>BOT_CLIENT_ID</code> в Railway
+        на это значение и перезапусти сервис, чтобы бот мог отправлять сообщения от имени нового профиля.</p>
+        <p>После этого найди в списке чатов «ДДС Бот» и пришли ему PDF-выписку Сбербанка.</p>
+        """
+    else:
+        body = """
+        <h2>ДДС-бот · install endpoint</h2>
+        <p>Этот URL принимает событие <code>ONAPPINSTALL</code> от Битрикса при первой установке приложения.</p>
+        <p>GET-запрос ничего не делает — приходи через POST из Bitrix24.</p>
+        """
+    return Response(
+        f"""<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8"><title>ДДС-бот · установка</title></head>
+<body style="font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:24px;line-height:1.5;">
+{body}
+</body></html>""",
+        mimetype="text/html; charset=utf-8",
+    )
+
+
+def _register_chat_bot(client_endpoint, access_token):
+    """Регистрирует чат-бота через imbot.register от имени установившего.
+
+    Передаём auth (access_token), Битрикс создаёт бота под нашим Local App.
+    После этого все ONIMBOTMESSAGEADD события будут приходить с auth[access_token]
+    того пользователя, кто отправил сообщение — и get_pdf_bytes сможет
+    скачивать файлы от его имени.
+
+    Возвращает BOT_ID при успехе, кидает ValueError при ошибке.
+    """
+    bot_handler_url = f"{APP_PUBLIC_URL}/bot"
+    payload = {
+        "CODE": "dds_bot",
+        "TYPE": "B",
+        "EVENT_HANDLER": bot_handler_url,
+        "EVENT_MESSAGE_ADD":     bot_handler_url,
+        "EVENT_WELCOME_MESSAGE": bot_handler_url,
+        "EVENT_BOT_DELETE":      bot_handler_url,
+        "PROPERTIES": {
+            "NAME": "ДДС Бот",
+            "WORK_POSITION": "PDF-выписки Сбербанка → Google-таблица",
+            "COLOR": "GREEN",
+        },
+    }
+    url = f"{client_endpoint.rstrip('/')}/imbot.register.json"
+    resp = requests.post(url, params={"auth": access_token}, json=payload, timeout=20)
+    print(f"imbot.register status={resp.status_code} body={safe_preview(resp.text, 500)}")
+    try:
+        result = resp.json()
+    except Exception as e:
+        raise ValueError(f"imbot.register: невалидный JSON в ответе: {e}")
+    if "error" in result:
+        raise ValueError(
+            f"imbot.register: {result.get('error_description') or result.get('error')}"
+        )
+    bot_id = result.get("result")
+    if not bot_id:
+        raise ValueError(f"imbot.register: пустой result, ответ: {safe_preview(resp.text, 300)}")
+    return bot_id
+
+
+@app.route("/install", methods=["GET", "POST"])
+def install_handler():
+    """Обработчик первоначальной установки Local App.
+
+    Битрикс шлёт сюда POST с событием ONAPPINSTALL, в auth[…] лежит
+    access_token того, кто устанавливает приложение. От его имени
+    регистрируем чат-бота через imbot.register — после этого все
+    последующие чат-события на /bot будут содержать auth[access_token]
+    отправителя сообщения, и patch в get_pdf_bytes (см. PR #2) наконец
+    сможет скачивать файлы.
+    """
+    if request.method == "GET":
+        return _render_install_page()
+
+    data = parse_request_data()
+    print("===== INSTALL EVENT =====")
+    print(safe_preview(data, 5000))
+
+    auth = parse_auth_from_event(data)
+    access_token    = auth.get("access_token")
+    client_endpoint = auth.get("client_endpoint")
+
+    if not access_token or not client_endpoint:
+        msg = ("Битрикс не прислал access_token или client_endpoint в событии установки. "
+               "Проверь, что приложение зарегистрировано как Серверное и имеет права imbot/im/disk.")
+        print(f"INSTALL ERROR: {msg}")
+        return _render_install_page(error=msg), 400
+
+    try:
+        bot_id = _register_chat_bot(client_endpoint, access_token)
+        print(f"✅ Бот зарегистрирован, BOT_ID={bot_id}")
+        return _render_install_page(bot_id=bot_id)
+    except Exception as e:
+        print(f"INSTALL ERROR: {e}")
+        return _render_install_page(error=str(e)), 500
 
 
 if __name__ == "__main__":
