@@ -348,6 +348,27 @@ def parse_request_data():
     return {}
 
 
+def parse_auth_from_event(data):
+    """Извлекает auth-данные из входящего события Bitrix.
+
+    В каждом событии бот-приложения Битрикс шлёт блок auth[…] — токен и
+    эндпоинт того портала и того ПОЛЬЗОВАТЕЛЯ, который инициировал событие
+    (например, отправил PDF в чат). Если использовать этот access_token
+    для последующих REST-запросов, они идут от имени этого пользователя —
+    у него точно есть доступ к собственным файлам, в отличие от
+    статического вебхука с зашитым user_id.
+
+    Возвращает dict с возможными ключами: access_token, application_token,
+    domain, client_endpoint. Любой из них может быть пустой строкой.
+    """
+    return {
+        "access_token":      str(data.get("auth[access_token]") or "").strip(),
+        "application_token": str(data.get("auth[application_token]") or "").strip(),
+        "domain":            str(data.get("auth[domain]") or "").strip(),
+        "client_endpoint":   str(data.get("auth[client_endpoint]") or "").strip(),
+    }
+
+
 def apply_rules(counterparty, description, amount, t_type):
     """Применяет правила категоризации."""
     text = f"{counterparty} {description}".upper()
@@ -837,16 +858,30 @@ def try_download(url, extra_headers=None):
     return None
 
 
-def get_pdf_bytes(file_id, fallback_url=None):
-    """Скачивает PDF — каждый раз получаем свежий URL и сразу качаем."""
+def get_pdf_bytes(file_id, fallback_url=None, auth=None):
+    """Скачивает PDF — каждый раз получаем свежий URL и сразу качаем.
 
-    def try_via_webhook(webhook_url, label):
-        """Получает свежий DOWNLOAD_URL и сразу скачивает файл."""
+    Стратегия (от самого надёжного к самому слабому):
+      0. Если в auth есть access_token + client_endpoint, ходим в REST
+         от имени пользователя, который отправил файл — у него точно
+         есть доступ к собственному файлу. Это решает проблему 403
+         для сотрудников, не являющихся владельцем вебхука.
+      1. Основной вебхук портала (legacy fallback).
+      2. Disk-вебхук, до 5 попыток с паузой (legacy fallback).
+      3. Прямой fallback_url из payload + Bearer-токен вебхука.
+    """
+
+    auth = auth or {}
+    user_token    = (auth.get("access_token") or "").strip()
+    user_endpoint = (auth.get("client_endpoint") or "").strip()
+
+    def fetch_via_endpoint(endpoint, params, label):
+        """Запрашивает disk.file.get у произвольного REST-эндпоинта,
+        достаёт DOWNLOAD_URL и сразу качает файл."""
         try:
-            # Увеличен таймаут с 30 до 60 секунд
             resp = requests.get(
-                f"{webhook_url}/disk.file.get.json",
-                params={"id": file_id},
+                f"{endpoint.rstrip('/')}/disk.file.get.json",
+                params=params,
                 timeout=60,
             )
             print(f"[{label}] disk.file.get status={resp.status_code}")
@@ -865,15 +900,30 @@ def get_pdf_bytes(file_id, fallback_url=None):
             print(f"[{label}] failed: {e}")
             return None
 
+    # Попытка 0: контекст пользователя, отправившего файл (самое надёжное)
+    if user_token and user_endpoint:
+        result = fetch_via_endpoint(
+            user_endpoint,
+            {"id": file_id, "auth": user_token},
+            "user-context",
+        )
+        if result:
+            return result
+        print("user-context failed, fallback to webhooks")
+    else:
+        print("no user access_token in event, skipping user-context attempt")
+
     # Попытка 1: основной вебхук
-    result = try_via_webhook(BITRIX_WEBHOOK_URL, "main")
+    result = fetch_via_endpoint(BITRIX_WEBHOOK_URL, {"id": file_id}, "main")
     if result:
         return result
 
     # Попытки 2-6: disk-вебхук (5 раз, каждый раз свежий URL, пауза между попытками)
     for attempt in range(5):
         print(f"disk webhook attempt {attempt + 1}/5")
-        result = try_via_webhook(BITRIX_DISK_WEBHOOK_URL, f"disk-{attempt+1}")
+        result = fetch_via_endpoint(
+            BITRIX_DISK_WEBHOOK_URL, {"id": file_id}, f"disk-{attempt+1}"
+        )
         if result:
             return result
         # Пауза перед следующей попыткой (кроме последней)
@@ -883,6 +933,12 @@ def get_pdf_bytes(file_id, fallback_url=None):
 
     # Fallback URL из payload
     if fallback_url:
+        # Если есть user access_token — пробуем им же
+        if user_token:
+            print("Trying fallback_url with user access_token (Bearer)")
+            result = try_download(fallback_url, {"Authorization": f"Bearer {user_token}"})
+            if result:
+                return result
         for label, token in [("main", BITRIX_WEBHOOK_URL.rstrip("/").split("/")[-1]), ("disk", DISK_TOKEN)]:
             print(f"Trying fallback_url with {label} Bearer token")
             result = try_download(fallback_url, {"Authorization": f"Bearer {token}"})
@@ -977,7 +1033,7 @@ def extract_transactions(pdf_bytes):
 # Фоновая обработка
 # ─────────────────────────────────────────────
 
-def process_pdf_async(dialog_id, file_id, fallback_url, uploader=""):
+def process_pdf_async(dialog_id, file_id, fallback_url, uploader="", auth=None):
     try:
         # Проверяем все сервисы перед обработкой
         problems = check_all_services()
@@ -987,7 +1043,7 @@ def process_pdf_async(dialog_id, file_id, fallback_url, uploader=""):
             send_message(dialog_id, msg)
             return
 
-        pdf_bytes = get_pdf_bytes(file_id, fallback_url=fallback_url)
+        pdf_bytes = get_pdf_bytes(file_id, fallback_url=fallback_url, auth=auth)
         send_message(dialog_id, "🔍 Анализирую выписку через ИИ...")
 
         transactions = extract_transactions(pdf_bytes)
@@ -1058,10 +1114,13 @@ def bot_handler():
 
     if filename.lower().endswith(".pdf") and file_id:
         uploader = extract_uploader_name(data)
+        # Достаём auth-токен пользователя из события — нужен для скачивания
+        # файлов, загруженных НЕ владельцем вебхука (см. get_pdf_bytes).
+        auth = parse_auth_from_event(data)
         send_message(dialog_id, "📄 Получил PDF, начинаю обработку...")
         thread = threading.Thread(
             target=process_pdf_async,
-            args=(dialog_id, file_id, fallback_url, uploader),
+            args=(dialog_id, file_id, fallback_url, uploader, auth),
             daemon=True,
         )
         thread.start()
