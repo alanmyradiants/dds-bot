@@ -6,7 +6,7 @@ import base64
 import threading
 import requests
 from datetime import datetime
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 from flask import Flask, request, jsonify, Response
 import anthropic
 from google.oauth2 import service_account
@@ -358,19 +358,21 @@ def parse_request_data():
 def parse_auth_from_event(data):
     """Извлекает auth-данные из входящего события Bitrix.
 
-    Битрикс присылает auth-блок в одном из двух форматов:
-      1) form-encoded с bracket notation (так шлются чат-события):
-         "auth[access_token]" = "..."
-      2) JSON с вложенным объектом (так часто шлётся ONAPPINSTALL):
-         {"auth": {"access_token": "..."}}
+    Битрикс присылает auth-блок в одном из ТРЁХ форматов в зависимости
+    от типа события и Content-Type:
 
-    Сначала пробуем bracket notation, потом nested dict — берём первое
-    непустое значение для каждого поля.
+      1) form-encoded с bracket notation (чат-события ONIMBOTMESSAGEADD):
+         "auth[access_token]" = "..."
+      2) JSON с вложенным объектом (некоторые OAuth-флоу):
+         {"auth": {"access_token": "..."}}
+      3) flat UPPERCASE (install/placement события Local App):
+         "AUTH_ID" = "...", "REFRESH_ID" = "...", "APPLICATION_TOKEN" = "..."
+
+    Пробуем все три по очереди — заполняем только пустые поля, не затирая.
 
     Возвращает dict с возможными ключами: access_token, application_token,
     domain, client_endpoint, refresh_token. Любой из них может быть пустой
-    строкой, если Битрикс его не прислал (например, для inbound webhook
-    бота access_token отсутствует в принципе).
+    строкой, если Битрикс его не прислал.
     """
     fields = ("access_token", "application_token", "domain",
               "client_endpoint", "refresh_token")
@@ -385,7 +387,36 @@ def parse_auth_from_event(data):
             if not result[f]:
                 result[f] = str(auth_obj.get(f) or "").strip()
 
+    # Формат 3: flat UPPERCASE (Local App install/placement payload).
+    # Битрикс шлёт AUTH_ID вместо access_token, REFRESH_ID вместо
+    # refresh_token. domain и client_endpoint в этом формате обычно
+    # отсутствуют — их нужно выводить из BITRIX_WEBHOOK_URL.
+    flat_uppercase_map = {
+        "access_token":      "AUTH_ID",
+        "refresh_token":     "REFRESH_ID",
+        "application_token": "APPLICATION_TOKEN",
+    }
+    for f, key in flat_uppercase_map.items():
+        if not result[f]:
+            result[f] = str(data.get(key) or "").strip()
+
     return result
+
+
+def derive_client_endpoint(fallback_url=None):
+    """Если в payload нет client_endpoint, выводим его из других известных
+    источников: BITRIX_WEBHOOK_URL → 'https://joto.bitrix24.ru/rest/'.
+    """
+    candidates = [fallback_url] if fallback_url else []
+    candidates.append(BITRIX_WEBHOOK_URL)
+    candidates.append(BITRIX_DISK_WEBHOOK_URL)
+    for url in candidates:
+        if not url:
+            continue
+        parsed = urlparse(url)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}/rest/"
+    return ""
 
 
 def apply_rules(counterparty, description, amount, t_type):
@@ -893,6 +924,10 @@ def get_pdf_bytes(file_id, fallback_url=None, auth=None):
     auth = auth or {}
     user_token    = (auth.get("access_token") or "").strip()
     user_endpoint = (auth.get("client_endpoint") or "").strip()
+    if user_token and not user_endpoint:
+        # На всякий случай — если событие пришло без client_endpoint,
+        # выводим его из основного вебхука (это всё ещё тот же портал).
+        user_endpoint = derive_client_endpoint()
 
     def fetch_via_endpoint(endpoint, params, label):
         """Запрашивает disk.file.get у произвольного REST-эндпоинта,
@@ -1276,15 +1311,14 @@ def _register_chat_bot(client_endpoint, access_token):
 def install_handler():
     """Обработчик первоначальной установки Local App.
 
-    Битрикс шлёт сюда POST с событием ONAPPINSTALL, в auth[…] лежит
-    access_token того, кто устанавливает приложение. От его имени
-    регистрируем чат-бота через imbot.register — после этого все
-    последующие чат-события на /bot будут содержать auth[access_token]
-    отправителя сообщения, и patch в get_pdf_bytes (см. PR #2) наконец
-    сможет скачивать файлы.
+    Битрикс шлёт сюда POST с auth-данными (в одном из трёх форматов —
+    parse_auth_from_event разберётся). От имени установившего регистрируем
+    чат-бота через imbot.register — после этого все последующие чат-события
+    на /bot будут содержать auth[access_token] отправителя сообщения, и
+    patch в get_pdf_bytes (PR #2) наконец сможет скачивать файлы.
 
-    Парсер auth понимает оба формата (bracket-notation и nested dict),
-    которые Битрикс может прислать в зависимости от Content-Type.
+    Для install-событий Битрикс не присылает client_endpoint — выводим его
+    из BITRIX_WEBHOOK_URL (тот же портал).
     """
     if request.method == "GET":
         return _render_install_page()
@@ -1300,19 +1334,24 @@ def install_handler():
 
     auth = parse_auth_from_event(data)
     access_token    = auth.get("access_token")
-    client_endpoint = auth.get("client_endpoint")
+    client_endpoint = auth.get("client_endpoint") or derive_client_endpoint()
+    print(f"access_token: {'set, len=' + str(len(access_token)) if access_token else 'EMPTY'}")
+    print(f"client_endpoint: {client_endpoint or 'EMPTY'}")
 
-    if not access_token or not client_endpoint:
-        # Собираем диагностику в саму ошибку — чтобы можно было увидеть
-        # на странице установки без лазания по логам Railway.
+    if not access_token:
         found_auth = {k: ("set" if v else "empty") for k, v in auth.items()}
         msg = (
-            "Битрикс не прислал access_token или client_endpoint. "
-            f"Что распарсилось из auth: {found_auth}. "
-            f"Top-level ключи payload: {top_keys}. "
-            f"data['auth'] был типа: {auth_obj_type}. "
-            "Скопируй этот текст и пришли мне — без него дальше копать сложно."
+            "Битрикс не прислал access_token ни в одном из известных форматов. "
+            f"Что распарсилось: {found_auth}. "
+            f"Top-level ключи: {top_keys}. "
+            "Скопируй текст и пришли мне."
         )
+        print(f"INSTALL ERROR: {msg}")
+        return _render_install_page(error=msg), 400
+
+    if not client_endpoint:
+        msg = ("Не удалось определить client_endpoint. Проверь, что переменная "
+               "BITRIX_WEBHOOK_URL в Railway указывает на твой портал Битрикса.")
         print(f"INSTALL ERROR: {msg}")
         return _render_install_page(error=msg), 400
 
