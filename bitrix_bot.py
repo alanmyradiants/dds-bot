@@ -1266,25 +1266,28 @@ def _render_install_page(bot_id=None, error=None):
     )
 
 
-def _try_unregister_existing(client_endpoint, access_token, code="dds_bot"):
-    """Best-effort удаление бота с тем же CODE перед повторной регистрацией.
-
-    Нужно при переустановке Local App: если бот уже есть, повторный
-    imbot.register может тихо переиспользовать старую запись с битыми
-    EVENT_HANDLER URL — а этого мы как раз и пытаемся избежать. Все
-    ошибки игнорируем, шаг чисто гигиенический.
+def _unregister_bot_by_id(client_endpoint, access_token, bot_id):
+    """Удаляет чат-бота по числовому BOT_ID. Это единственная форма,
+    которую imbot.unregister реально принимает: вызов с CODE=... всегда
+    возвращает Bot not found. Возвращает True если бот действительно
+    удалён, False иначе. Все ошибки логируем, но не падаем — это
+    зачистка перед регистрацией.
     """
     try:
         url = f"{client_endpoint.rstrip('/')}/imbot.unregister.json"
         resp = requests.post(
             url,
-            data={"auth": access_token, "CODE": code},
+            data={"auth": access_token, "BOT_ID": int(bot_id)},
             timeout=10,
         )
-        print(f"imbot.unregister(CODE={code}) status={resp.status_code} "
-              f"body={safe_preview(resp.text, 300)}")
+        body_preview = safe_preview(resp.text, 200)
+        print(f"imbot.unregister(BOT_ID={bot_id}) status={resp.status_code} body={body_preview}")
+        if resp.status_code != 200:
+            return False
+        return not resp.json().get("error")
     except Exception as e:
-        print(f"_try_unregister_existing: {e}")
+        print(f"_unregister_bot_by_id({bot_id}): {e}")
+        return False
 
 
 def _bind_chat_events(client_endpoint, access_token, handler_url):
@@ -1331,28 +1334,44 @@ def _bind_chat_events(client_endpoint, access_token, handler_url):
 def _register_chat_bot(client_endpoint, access_token):
     """Регистрирует чат-бота через imbot.register от имени установившего.
 
-    ВАЖНО: Bitrix24 при imbot.register НЕ парсит вложенные JSON-структуры
-    для PROPERTIES. Если отправить json={"PROPERTIES": {...}}, бот
-    зарегистрируется, но с кривыми EVENT_HANDLER URL — и Битрикс не будет
-    доставлять сообщения на наш /bot. Поэтому шлём form-encoded
-    (data=...) с bracket-notation: PROPERTIES[NAME], PROPERTIES[COLOR].
+    Главное открытие после ночи дебага:
+    -----------------------------------
+    Bitrix24 imbot.unregister(CODE=...) НЕ работает — всегда возвращает
+    "Bot not found". Только imbot.unregister(BOT_ID=число) реально удаляет
+    бота. Из-за этого все наши предыдущие переустановки оставляли в
+    Битриксе СТАРУЮ запись бота 256, созданную самым первым багованным
+    PR #3 (json-body вместо form-encoded). И каждый последующий
+    imbot.register просто переиспользовал ту запись со СТАРЫМИ
+    EVENT_MESSAGE_ADD = пустыми URL. Поэтому Битрикс никуда не доставлял
+    события — handler URL у бота буквально не было прописано.
 
-    Перед регистрацией пробуем удалить бота с таким же CODE
-    (best-effort), чтобы пере-установка прошла чисто.
+    Что делаем теперь (bulldoze + double-register):
+      1) Заранее пытаемся снести любых известных «исторических» ботов
+         по диапазону BOT_ID 255-269.
+      2) Делаем первичный register — он либо вернёт существующий ID,
+         либо создаст нового.
+      3) Удаляем то, что вернулось (по BOT_ID).
+      4) Делаем второй register — это даст ГАРАНТИРОВАННО чистую запись
+         со свежими EVENT_MESSAGE_ADD URL.
+      5) Дополнительно вызываем event.bind как страховку.
 
-    Возвращает BOT_ID при успехе, кидает ValueError при ошибке.
+    PROPERTIES шлём form-encoded с bracket-notation — Битрикс не парсит
+    nested JSON для этих полей.
     """
     bot_handler_url = f"{APP_PUBLIC_URL}/bot"
+    register_url = f"{client_endpoint.rstrip('/')}/imbot.register.json"
 
-    # Чистим возможного дубликата перед регистрацией
-    _try_unregister_existing(client_endpoint, access_token, code="dds_bot")
+    # Шаг 1: зачистка по диапазону известных исторических BOT_ID.
+    # Большинство удалений вернут "Bot not found" — это нормально.
+    print("[bulldoze] removing any historical bots by BOT_ID range")
+    for bid in range(255, 270):
+        _unregister_bot_by_id(client_endpoint, access_token, bid)
 
-    # form-encoded (data=...), не json= — иначе PROPERTIES не дойдут.
-    data = {
+    # form-encoded payload для register (используем дважды).
+    register_data = {
         "auth":                      access_token,
         "CODE":                      "dds_bot",
         "TYPE":                      "B",
-        "EVENT_HANDLER":             bot_handler_url,
         "EVENT_MESSAGE_ADD":         bot_handler_url,
         "EVENT_WELCOME_MESSAGE":     bot_handler_url,
         "EVENT_BOT_DELETE":          bot_handler_url,
@@ -1360,27 +1379,48 @@ def _register_chat_bot(client_endpoint, access_token):
         "PROPERTIES[WORK_POSITION]": "PDF-выписки Сбербанка → Google-таблица",
         "PROPERTIES[COLOR]":         "GREEN",
     }
-    url = f"{client_endpoint.rstrip('/')}/imbot.register.json"
-    resp = requests.post(url, data=data, timeout=20)
-    print(f"imbot.register status={resp.status_code} body={safe_preview(resp.text, 500)}")
-    try:
-        result = resp.json()
-    except Exception as e:
-        raise ValueError(f"imbot.register: невалидный JSON в ответе: {e}")
-    if "error" in result:
-        raise ValueError(
-            f"imbot.register: {result.get('error_description') or result.get('error')}"
-        )
-    bot_id = result.get("result")
-    if not bot_id:
-        raise ValueError(f"imbot.register: пустой result, ответ: {safe_preview(resp.text, 300)}")
 
-    # Критический шаг для Local App: привязываем события к нашему handler URL.
-    # imbot.register их сам не привязывает, без этого Битрикс не доставляет
-    # ONIMBOTMESSAGEADD на /bot.
+    # Шаг 2: первый register — узнаём фактический BOT_ID
+    resp1 = requests.post(register_url, data=register_data, timeout=20)
+    print(f"[register #1] status={resp1.status_code} body={safe_preview(resp1.text, 500)}")
+    try:
+        result1 = resp1.json()
+    except Exception as e:
+        raise ValueError(f"imbot.register #1: невалидный JSON в ответе: {e}")
+    if "error" in result1:
+        raise ValueError(
+            f"imbot.register #1: {result1.get('error_description') or result1.get('error')}"
+        )
+    bot_id_1 = result1.get("result")
+    if not bot_id_1:
+        raise ValueError(f"imbot.register #1: пустой result, ответ: {safe_preview(resp1.text, 300)}")
+
+    # Шаг 3: удаляем то, что register вернул — даже если это новая запись,
+    # без удаления нет гарантии, что Битрикс правильно сохранил EVENT_*
+    # поля. После удаления следующий register создаст 100% свежую запись.
+    print(f"[bulldoze] removing bot returned by first register: BOT_ID={bot_id_1}")
+    _unregister_bot_by_id(client_endpoint, access_token, bot_id_1)
+
+    # Шаг 4: финальный register — гарантированно создаёт новую запись
+    # с правильными EVENT_MESSAGE_ADD = bot_handler_url
+    resp2 = requests.post(register_url, data=register_data, timeout=20)
+    print(f"[register #2 fresh] status={resp2.status_code} body={safe_preview(resp2.text, 500)}")
+    try:
+        result2 = resp2.json()
+    except Exception as e:
+        raise ValueError(f"imbot.register #2: невалидный JSON в ответе: {e}")
+    if "error" in result2:
+        raise ValueError(
+            f"imbot.register #2: {result2.get('error_description') or result2.get('error')}"
+        )
+    final_bot_id = result2.get("result")
+    if not final_bot_id:
+        raise ValueError(f"imbot.register #2: пустой result, ответ: {safe_preview(resp2.text, 300)}")
+
+    # Шаг 5: на всякий случай ещё и event.bind для app-level подписки.
     _bind_chat_events(client_endpoint, access_token, bot_handler_url)
 
-    return bot_id
+    return final_bot_id
 
 
 @app.route("/install", methods=["GET", "POST"])
