@@ -1219,10 +1219,23 @@ def find_recent_pdf_in_chat(dialog_id, access_token=None, limit=10):
             return None
         result = body.get("result") or {}
         messages = result.get("messages") or []
-        files_dict = result.get("files") or {}
+        files_raw = result.get("files")
 
-        # Bitrix отдаёт files как dict {file_id: file_info}; messages — массив.
-        # Идём от самого свежего к старому.
+        # Bitrix может вернуть files как dict {file_id: info}, как список
+        # [info, info, ...] или None. Нормализуем в dict по id.
+        files_dict = {}
+        if isinstance(files_raw, dict):
+            for k, v in files_raw.items():
+                files_dict[str(k)] = v
+                if isinstance(v, dict) and v.get("id") is not None:
+                    files_dict[str(v.get("id"))] = v
+        elif isinstance(files_raw, list):
+            for item in files_raw:
+                if isinstance(item, dict):
+                    fid = item.get("id") or item.get("ID")
+                    if fid is not None:
+                        files_dict[str(fid)] = item
+
         def msg_ts(m):
             return str(m.get("date") or m.get("DATE") or "")
 
@@ -1230,20 +1243,40 @@ def find_recent_pdf_in_chat(dialog_id, access_token=None, limit=10):
 
         for msg in sorted_msgs:
             mparams = msg.get("params") or {}
-            # FILE_ID — список ID файлов, привязанных к сообщению
             file_ids = mparams.get("FILE_ID") or []
             if not isinstance(file_ids, list):
                 file_ids = [file_ids]
             for fid in file_ids:
                 fid_str = str(fid)
-                file_info = files_dict.get(fid_str) or files_dict.get(fid) or {}
-                name = file_info.get("name") or file_info.get("NAME") or ""
+                file_info = files_dict.get(fid_str) or {}
+                name = ""
+                url_dl = None
+                if isinstance(file_info, dict):
+                    name = file_info.get("name") or file_info.get("NAME") or ""
+                    url_dl = file_info.get("urlDownload") or file_info.get("URL_DOWNLOAD")
+                # Если в files нет инфы — можно попробовать достать имя из ATTACH
+                if not name:
+                    attach = mparams.get("ATTACH") or []
+                    if isinstance(attach, list):
+                        for a in attach:
+                            if isinstance(a, dict):
+                                blocks = a.get("BLOCKS") or a.get("blocks") or []
+                                for b in blocks:
+                                    if isinstance(b, dict):
+                                        files_block = b.get("FILE") or b.get("file") or []
+                                        if isinstance(files_block, list):
+                                            for fb in files_block:
+                                                if isinstance(fb, dict):
+                                                    cand_name = fb.get("NAME") or fb.get("name") or ""
+                                                    if cand_name.lower().endswith(".pdf"):
+                                                        name = cand_name
+                                                        url_dl = url_dl or fb.get("LINK") or fb.get("link")
                 if name.lower().endswith(".pdf"):
                     print(f"[recent-files] found PDF in msg id={msg.get('id')}: {name} (file_id={fid_str})")
                     return {
                         "file_id":      fid_str,
                         "filename":     name or "document.pdf",
-                        "url_download": file_info.get("urlDownload") or file_info.get("URL_DOWNLOAD") or None,
+                        "url_download": url_dl,
                     }
         print("[recent-files] no PDF found in last messages")
         return None
@@ -1492,7 +1525,7 @@ def _register_chat_bot(client_endpoint, access_token):
       3) Удаляем то, что вернулось (по BOT_ID).
       4) Делаем второй register — это даст ГАРАНТИРОВАННО чистую запись
          со свежими EVENT_MESSAGE_ADD URL.
-      5) Дополнительно вызываем event.bind как страховку.
+      5) Дополнительно вызываем event.bind как страховка.
 
     PROPERTIES шлём form-encoded с bracket-notation — Битрикс не парсит
     nested JSON для этих полей.
