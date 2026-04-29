@@ -1266,32 +1266,61 @@ def _render_install_page(bot_id=None, error=None):
     )
 
 
+def _try_unregister_existing(client_endpoint, access_token, code="dds_bot"):
+    """Best-effort удаление бота с тем же CODE перед повторной регистрацией.
+
+    Нужно при переустановке Local App: если бот уже есть, повторный
+    imbot.register может тихо переиспользовать старую запись с битыми
+    EVENT_HANDLER URL — а этого мы как раз и пытаемся избежать. Все
+    ошибки игнорируем, шаг чисто гигиенический.
+    """
+    try:
+        url = f"{client_endpoint.rstrip('/')}/imbot.unregister.json"
+        resp = requests.post(
+            url,
+            data={"auth": access_token, "CODE": code},
+            timeout=10,
+        )
+        print(f"imbot.unregister(CODE={code}) status={resp.status_code} "
+              f"body={safe_preview(resp.text, 300)}")
+    except Exception as e:
+        print(f"_try_unregister_existing: {e}")
+
+
 def _register_chat_bot(client_endpoint, access_token):
     """Регистрирует чат-бота через imbot.register от имени установившего.
 
-    Передаём auth (access_token), Битрикс создаёт бота под нашим Local App.
-    После этого все ONIMBOTMESSAGEADD события будут приходить с auth[access_token]
-    того пользователя, кто отправил сообщение — и get_pdf_bytes сможет
-    скачивать файлы от его имени.
+    ВАЖНО: Bitrix24 при imbot.register НЕ парсит вложенные JSON-структуры
+    для PROPERTIES. Если отправить json={"PROPERTIES": {...}}, бот
+    зарегистрируется, но с кривыми EVENT_HANDLER URL — и Битрикс не будет
+    доставлять сообщения на наш /bot. Поэтому шлём form-encoded
+    (data=...) с bracket-notation: PROPERTIES[NAME], PROPERTIES[COLOR].
+
+    Перед регистрацией пробуем удалить бота с таким же CODE
+    (best-effort), чтобы пере-установка прошла чисто.
 
     Возвращает BOT_ID при успехе, кидает ValueError при ошибке.
     """
     bot_handler_url = f"{APP_PUBLIC_URL}/bot"
-    payload = {
-        "CODE": "dds_bot",
-        "TYPE": "B",
-        "EVENT_HANDLER": bot_handler_url,
-        "EVENT_MESSAGE_ADD":     bot_handler_url,
-        "EVENT_WELCOME_MESSAGE": bot_handler_url,
-        "EVENT_BOT_DELETE":      bot_handler_url,
-        "PROPERTIES": {
-            "NAME": "ДДС Бот",
-            "WORK_POSITION": "PDF-выписки Сбербанка → Google-таблица",
-            "COLOR": "GREEN",
-        },
+
+    # Чистим возможного дубликата перед регистрацией
+    _try_unregister_existing(client_endpoint, access_token, code="dds_bot")
+
+    # form-encoded (data=...), не json= — иначе PROPERTIES не дойдут.
+    data = {
+        "auth":                      access_token,
+        "CODE":                      "dds_bot",
+        "TYPE":                      "B",
+        "EVENT_HANDLER":             bot_handler_url,
+        "EVENT_MESSAGE_ADD":         bot_handler_url,
+        "EVENT_WELCOME_MESSAGE":     bot_handler_url,
+        "EVENT_BOT_DELETE":          bot_handler_url,
+        "PROPERTIES[NAME]":          "ДДС Бот",
+        "PROPERTIES[WORK_POSITION]": "PDF-выписки Сбербанка → Google-таблица",
+        "PROPERTIES[COLOR]":         "GREEN",
     }
     url = f"{client_endpoint.rstrip('/')}/imbot.register.json"
-    resp = requests.post(url, params={"auth": access_token}, json=payload, timeout=20)
+    resp = requests.post(url, data=data, timeout=20)
     print(f"imbot.register status={resp.status_code} body={safe_preview(resp.text, 500)}")
     try:
         result = resp.json()
