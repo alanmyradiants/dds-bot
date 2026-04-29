@@ -1287,6 +1287,47 @@ def _try_unregister_existing(client_endpoint, access_token, code="dds_bot"):
         print(f"_try_unregister_existing: {e}")
 
 
+def _bind_chat_events(client_endpoint, access_token, handler_url):
+    """Привязывает события чат-бота к нашему handler URL через event.bind.
+
+    Это критический шаг для Local App, который imbot.register НЕ делает
+    автоматически. Без этих привязок Битрикс не знает, куда слать
+    ONIMBOTMESSAGEADD и прочие события — даже если бот зарегистрирован.
+
+    Перед привязкой пробуем event.unbind по тем же событиям —
+    на случай повторной установки. Все ошибки логируем но не падаем.
+    """
+    events = ("ONIMBOTMESSAGEADD", "ONIMBOTJOINCHAT", "ONIMBOTDELETE")
+    base = client_endpoint.rstrip("/")
+    for event_name in events:
+        # Снимаем старую привязку (best-effort) — нужно при переустановке,
+        # иначе event.bind может вернуть ERROR_EVENT_FOUND.
+        try:
+            r = requests.post(
+                f"{base}/event.unbind.json",
+                data={"auth": access_token, "event": event_name,
+                      "handler": handler_url},
+                timeout=10,
+            )
+            print(f"event.unbind({event_name}) status={r.status_code} "
+                  f"body={safe_preview(r.text, 200)}")
+        except Exception as e:
+            print(f"event.unbind({event_name}): {e}")
+
+        # Привязываем заново
+        try:
+            r = requests.post(
+                f"{base}/event.bind.json",
+                data={"auth": access_token, "event": event_name,
+                      "handler": handler_url},
+                timeout=10,
+            )
+            print(f"event.bind({event_name}) status={r.status_code} "
+                  f"body={safe_preview(r.text, 200)}")
+        except Exception as e:
+            print(f"event.bind({event_name}): {e}")
+
+
 def _register_chat_bot(client_endpoint, access_token):
     """Регистрирует чат-бота через imbot.register от имени установившего.
 
@@ -1333,6 +1374,12 @@ def _register_chat_bot(client_endpoint, access_token):
     bot_id = result.get("result")
     if not bot_id:
         raise ValueError(f"imbot.register: пустой result, ответ: {safe_preview(resp.text, 300)}")
+
+    # Критический шаг для Local App: привязываем события к нашему handler URL.
+    # imbot.register их сам не привязывает, без этого Битрикс не доставляет
+    # ONIMBOTMESSAGEADD на /bot.
+    _bind_chat_events(client_endpoint, access_token, bot_handler_url)
+
     return bot_id
 
 
