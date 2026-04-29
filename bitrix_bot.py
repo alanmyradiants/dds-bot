@@ -908,6 +908,47 @@ def try_download(url, extra_headers=None):
     return None
 
 
+def fetch_via_attached_object(endpoint, file_id, label, access_token=None):
+    """disk.attachedObject.get — для файлов, прикреплённых к чату.
+
+    В Битриксе у chat-attached файлов есть отдельный «attached object»,
+    к которому имеют доступ ВСЕ участники чата, даже если на сам файл
+    в Диске прав нет. Это спасает ситуацию, когда сотрудник присылает
+    PDF из своего личного Диска — обычный disk.file.get вернёт 403,
+    а disk.attachedObject.get может отдать ссылку на скачивание.
+
+    Bitrix принимает в качестве id как attached_object_id, так и
+    в некоторых конфигурациях file_id (он внутри ищет привязанный
+    объект). Пробуем file_id — если Bitrix умеет, найдёт сам.
+    """
+    try:
+        params = {"id": file_id}
+        if access_token:
+            params["auth"] = access_token
+        resp = requests.get(
+            f"{endpoint.rstrip('/')}/disk.attachedObject.get.json",
+            params=params,
+            timeout=60,
+        )
+        body_preview = safe_preview(resp.text, 300)
+        print(f"[{label}] disk.attachedObject.get status={resp.status_code} body={body_preview}")
+        if resp.status_code != 200:
+            return None
+        payload = resp.json()
+        if payload.get("error"):
+            return None
+        result_obj = payload.get("result") or {}
+        dl = extract_download_url(result_obj)
+        if not dl:
+            print(f"[{label}] no download_url in attachedObject result")
+            return None
+        print(f"[{label}] downloading via attachedObject...")
+        return try_download(dl)
+    except Exception as e:
+        print(f"[{label}] attachedObject failed: {e}")
+        return None
+
+
 def get_pdf_bytes(file_id, fallback_url=None, auth=None):
     """Скачивает PDF — каждый раз получаем свежий URL и сразу качаем.
 
@@ -966,6 +1007,18 @@ def get_pdf_bytes(file_id, fallback_url=None, auth=None):
         print("user-context failed, fallback to webhooks")
     else:
         print("no user access_token in event, skipping user-context attempt")
+
+    # Попытка 0.5: disk.attachedObject.get — для файлов в чатах.
+    # Это спасает кейс, когда не-владелец webhook'а (сотрудник) загружает
+    # PDF — disk.file.get вернёт 403, а attachedObject доступен участникам
+    # чата (бот == участник чата, поэтому может скачать).
+    print("[main] trying disk.attachedObject.get for chat-attached file")
+    result = fetch_via_attached_object(BITRIX_WEBHOOK_URL, file_id, "main-attached", access_token=user_token or None)
+    if result:
+        return result
+    result = fetch_via_attached_object(BITRIX_DISK_WEBHOOK_URL, file_id, "disk-attached")
+    if result:
+        return result
 
     # Попытка 1: основной вебхук
     result = fetch_via_endpoint(BITRIX_WEBHOOK_URL, {"id": file_id}, "main")
