@@ -1193,6 +1193,65 @@ def process_pdf_async(dialog_id, file_id, fallback_url, uploader="", auth=None):
 # Webhook handler
 # ─────────────────────────────────────────────
 
+def find_recent_pdf_in_chat(dialog_id, access_token=None, limit=10):
+    """Ищет самый свежий PDF среди последних N сообщений чата.
+
+    Используется когда бот @упомянули, но файл к самому сообщению не
+    прикреплён — например, человек прислал файл, потом отдельной строкой
+    написал «@ДДС Бот» (или сделал reply с упоминанием на чужой файл).
+
+    Делает im.dialog.messages.get и в каждом сообщении смотрит params.FILE_ID
+    + params.ATTACH. Если нашли файл (с расширением .pdf) — возвращаем
+    {file_id, filename, url_download}, иначе None.
+    """
+    try:
+        url = f"{BITRIX_WEBHOOK_URL}/im.dialog.messages.get.json"
+        params = {"DIALOG_ID": dialog_id, "LIMIT": limit}
+        if access_token:
+            params["auth"] = access_token
+        resp = requests.get(url, params=params, timeout=15)
+        print(f"im.dialog.messages.get status={resp.status_code}")
+        if resp.status_code != 200:
+            return None
+        body = resp.json()
+        if body.get("error"):
+            print(f"im.dialog.messages.get error: {safe_preview(resp.text, 200)}")
+            return None
+        result = body.get("result") or {}
+        messages = result.get("messages") or []
+        files_dict = result.get("files") or {}
+
+        # Bitrix отдаёт files как dict {file_id: file_info}; messages — массив.
+        # Идём от самого свежего к старому.
+        def msg_ts(m):
+            return str(m.get("date") or m.get("DATE") or "")
+
+        sorted_msgs = sorted(messages, key=msg_ts, reverse=True)
+
+        for msg in sorted_msgs:
+            mparams = msg.get("params") or {}
+            # FILE_ID — список ID файлов, привязанных к сообщению
+            file_ids = mparams.get("FILE_ID") or []
+            if not isinstance(file_ids, list):
+                file_ids = [file_ids]
+            for fid in file_ids:
+                fid_str = str(fid)
+                file_info = files_dict.get(fid_str) or files_dict.get(fid) or {}
+                name = file_info.get("name") or file_info.get("NAME") or ""
+                if name.lower().endswith(".pdf"):
+                    print(f"[recent-files] found PDF in msg id={msg.get('id')}: {name} (file_id={fid_str})")
+                    return {
+                        "file_id":      fid_str,
+                        "filename":     name or "document.pdf",
+                        "url_download": file_info.get("urlDownload") or file_info.get("URL_DOWNLOAD") or None,
+                    }
+        print("[recent-files] no PDF found in last messages")
+        return None
+    except Exception as e:
+        print(f"find_recent_pdf_in_chat error: {e}")
+        return None
+
+
 @app.route("/bot", methods=["GET", "POST"])
 def bot_handler():
     if request.method == "GET":
@@ -1218,6 +1277,33 @@ def bot_handler():
     file_id      = file_info.get("file_id")
     filename     = file_info.get("filename") or ""
     fallback_url = file_info.get("url_download")
+
+    # Если в текущем сообщении PDF не найден, но бот упомянут или это reply —
+    # ищем PDF в последних 10 сообщениях чата. Это покрывает кейсы:
+    #   1) Файл прислан + потом отдельно «@ДДС Бот» (как в Telegram)
+    #   2) Reply на чьё-то сообщение с PDF + @упоминание бота
+    #   3) Любое @упоминание бота, когда в чате недавно был PDF
+    if not (filename.lower().endswith(".pdf") and file_id):
+        bot_mentioned = False
+        # Битрикс кладёт упоминания как data[PARAMS][MENTIONED_LIST][BOT_ID]
+        for k in data.keys():
+            if k.startswith("data[PARAMS][MENTIONED_LIST]"):
+                bot_mentioned = True
+                break
+        reply_id = data.get("data[PARAMS][REPLY_ID]") or ""
+        if bot_mentioned or reply_id:
+            print(f"[recent-files] bot mentioned (or reply: {reply_id}), "
+                  f"searching for PDF in recent chat messages")
+            auth_for_search = parse_auth_from_event(data)
+            recent_pdf = find_recent_pdf_in_chat(
+                dialog_id,
+                access_token=(auth_for_search.get("access_token") or None),
+                limit=10,
+            )
+            if recent_pdf:
+                file_id = recent_pdf["file_id"]
+                filename = recent_pdf["filename"]
+                fallback_url = recent_pdf["url_download"]
 
     if filename.lower().endswith(".pdf") and file_id:
         uploader = extract_uploader_name(data)
