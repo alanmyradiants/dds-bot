@@ -472,9 +472,9 @@ def init_sheets():
         ).execute()
 
     # Заголовки Транзакции — вставляем принудительно в строку 1
-    headers = [["Дата загрузки", "Кто загрузил", "Дата операции", "Время", "Код авторизации", "Месяц", "Контрагент",
+    headers = [["Дата загрузки", "Кто загрузил", "Владелец счета", "Дата операции", "Время", "Код авторизации", "Месяц", "Контрагент",
                 "Описание", "Приход", "Расход", "Категория",
-                "Личное/Бизнес", "Статус", "Владелец счета"]]
+                "Личное/Бизнес", "Статус"]]
 
     # Всегда перезаписываем заголовки в строке 1
     service.spreadsheets().values().update(
@@ -728,6 +728,7 @@ def write_to_sheets(transactions, uploader="", account_owner=""):
         rows.append([
             upload_date,
             uploader,
+            account_owner,
             date_str,
             t.get("time", ""),
             auth_code,
@@ -736,10 +737,9 @@ def write_to_sheets(transactions, uploader="", account_owner=""):
             description,
             inc,
             exp,
-            "=IFERROR(VLOOKUP(G" + str(current_row) + ";'Правила'!$A:$B;2;0);\"? Уточнить\")",
-            "=IFERROR(VLOOKUP(G" + str(current_row) + ";'Правила'!$A:$C;3;0);\"\")",
+            "=IFERROR(VLOOKUP(H" + str(current_row) + ";'Правила'!$A:$B;2;0);\"? Уточнить\")",
+            "=IFERROR(VLOOKUP(H" + str(current_row) + ";'Правила'!$A:$C;3;0);\"\")",
             status,
-            account_owner,
         ])
         current_row += 1
 
