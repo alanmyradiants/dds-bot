@@ -632,7 +632,7 @@ def get_existing_auth_codes(service):
     return auth_codes
 
 
-def write_to_sheets(transactions, uploader=""):
+def write_to_sheets(transactions, uploader="", account_owner=""):
     """Записывает транзакции в Google Sheets."""
     service = get_sheets_service()
     from datetime import timezone, timedelta
@@ -739,13 +739,14 @@ def write_to_sheets(transactions, uploader=""):
             "=IFERROR(VLOOKUP(G" + str(current_row) + ";'Правила'!$A:$B;2;0);\"? Уточнить\")",
             "=IFERROR(VLOOKUP(G" + str(current_row) + ";'Правила'!$A:$C;3;0);\"\")",
             status,
+            account_owner,
         ])
         current_row += 1
 
     # Записываем транзакции
     service.spreadsheets().values().append(
         spreadsheetId=SHEET_ID,
-        range="Транзакции!A:M",
+        range="Транзакции!A:N",
         valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
         body={"values": rows},
@@ -1065,23 +1066,26 @@ def extract_transactions(pdf_bytes):
 
     pdf_b64 = base64.b64encode(pdf_bytes).decode()
 
-    system_prompt = f"""Из банковской выписки Сбербанка извлеки ВСЕ транзакции.
+    system_prompt = f"""Из банковской выписки Сбербанка извлеки:
+1. ВСЕ транзакции
+2. Владельца счета (ищи "Владелец счета" и полное имя после него)
 
-Каждая транзакция в выписке содержит две строки:
-- Первая: дата операции, время, категория, сумма
-- Вторая: дата обработки, код авторизации, описание операции
-
-Верни ТОЛЬКО JSON массив без markdown:
-[{{
-  "date": "ДД.ММ.ГГГГ",
-  "time": "ЧЧ:ММ",
-  "processing_date": "ДД.ММ.ГГГГ",
-  "auth_code": "646991",
-  "description": "текст описания",
-  "amount": 100.0,
-  "type": "in",
-  "counterparty": "краткое название"
-}}]
+Верни ТОЛЬКО JSON объект БЕЗ markdown и БЕЗ дополнительного текста:
+{{
+  "account_owner": "Фамилия Имя Отчество или как указано в выписке",
+  "transactions": [
+    {{
+      "date": "ДД.ММ.ГГГГ",
+      "time": "ЧЧ:ММ",
+      "processing_date": "ДД.ММ.ГГГГ",
+      "auth_code": "646991",
+      "description": "текст описания",
+      "amount": 100.0,
+      "type": "in",
+      "counterparty": "краткое название"
+    }}
+  ]
+}}
 
 Правила:
 - type: in=поступление/зачисление, out=списание. amount всегда положительное.
@@ -1089,6 +1093,7 @@ def extract_transactions(pdf_bytes):
 - auth_code — код авторизации (6 цифр), если есть
 - time — время операции в формате ЧЧ:ММ
 - processing_date — дата обработки (вторая строка транзакции)
+- account_owner — полное имя владельца счета как написано в выписке (ФИО)
 - НЕ добавляй поле category"""
 
     with client.messages.stream(
@@ -1099,7 +1104,7 @@ def extract_transactions(pdf_bytes):
             "role": "user",
             "content": [
                 {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64}},
-                {"type": "text", "text": "Извлеки все транзакции."},
+                {"type": "text", "text": "Извлеки владельца счета и все транзакции."},
             ],
         }],
     ) as stream:
@@ -1107,31 +1112,39 @@ def extract_transactions(pdf_bytes):
 
     print(f"Claude response: {safe_preview(text, 500)}")
 
-    start = text.find("[")
+    start = text.find("{")
     if start == -1:
-        raise ValueError(f"Транзакции не найдены. Ответ: {safe_preview(text, 300)}")
+        raise ValueError(f"JSON не найден. Ответ: {safe_preview(text, 300)}")
 
-    end = text.rfind("]")
+    end = text.rfind("}")
 
-    # Если ] не найден — JSON обрезан, восстанавливаем
+    # Если } не найден — JSON обрезан, восстанавливаем
     if end == -1 or end < start:
-        print("JSON обрезан — восстанавливаем по последнему }")
-        last_close = text.rfind("}")
+        print("JSON обрезан — восстанавливаем по последнему ]")
+        last_close = text.rfind("]")
         if last_close == -1:
-            raise ValueError("Не удалось найти транзакции в ответе")
-        json_str = text[start:last_close + 1] + "]"
+            raise ValueError("Не удалось найти данные в ответе")
+        json_str = text[start:last_close + 1]
     else:
         json_str = text[start:end + 1]
 
     try:
-        return json.loads(json_str)
+        data = json.loads(json_str)
+        account_owner = data.get("account_owner", "")
+        transactions = data.get("transactions", [])
+        print(f"✅ Извлечено: владелец='{account_owner}', транзакций={len(transactions)}")
+        return account_owner, transactions
     except json.JSONDecodeError:
-        # Ещё раз пробуем восстановить по последнему }
-        last_close = json_str.rfind("}")
+        # Ещё раз пробуем восстановить по последнему ]
+        last_close = json_str.rfind("]")
         if last_close == -1:
             raise ValueError("Не удалось распарсить ответ ИИ")
         try:
-            return json.loads(json_str[:last_close + 1] + "]")
+            data = json.loads(json_str[:last_close + 1])
+            account_owner = data.get("account_owner", "")
+            transactions = data.get("transactions", [])
+            print(f"✅ Извлечено (после восстановления): владелец='{account_owner}', транзакций={len(transactions)}")
+            return account_owner, transactions
         except json.JSONDecodeError as e:
             raise ValueError(f"Ошибка парсинга JSON: {e}")
 
@@ -1153,13 +1166,13 @@ def process_pdf_async(dialog_id, file_id, fallback_url, uploader="", auth=None):
         pdf_bytes = get_pdf_bytes(file_id, fallback_url=fallback_url, auth=auth)
         send_message(dialog_id, "🔍 Анализирую выписку через ИИ...")
 
-        transactions = extract_transactions(pdf_bytes)
+        account_owner, transactions = extract_transactions(pdf_bytes)
 
         total_in  = sum(float(t.get("amount", 0) or 0) for t in transactions if t.get("type") == "in")
         total_out = sum(float(t.get("amount", 0) or 0) for t in transactions if t.get("type") == "out")
 
         send_message(dialog_id, "📊 Записываю в таблицу...")
-        clarify_list, skipped = write_to_sheets(transactions, uploader=uploader)
+        clarify_list, skipped = write_to_sheets(transactions, uploader=uploader, account_owner=account_owner)
 
         skipped_text = f"\n⚠️ Пропущено дублей: {skipped}" if skipped > 0 else ""
         # Основное сообщение
@@ -1169,7 +1182,8 @@ def process_pdf_async(dialog_id, file_id, fallback_url, uploader="", auth=None):
             f"📈 Поступления: {total_in:,.2f} ₽\n"
             f"📉 Списания: {total_out:,.2f} ₽"
 
-            f"{skipped_text}\n\n"
+            f"{skipped_text}\n"
+            f"👤 Владелец счета: {account_owner}\n\n"
             f"🔗 [url={SHEET_URL}]Открыть таблицу Расходы Сбер[/url]"
         )
 
