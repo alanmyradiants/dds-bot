@@ -1896,8 +1896,8 @@ def _render_payment_form(users, categories, error=None):
       <label>Получатель <span class="req">*</span></label>
       <input type="text" name="recipient" placeholder="Кому платим: название / ФИО / ИП" required>
 
-      <label>Реквизиты <span class="req">*</span></label>
-      <textarea name="requisites" placeholder="Счёт / карта / ИНН / БИК" required></textarea>
+      <label>Реквизиты</label>
+      <textarea name="requisites" placeholder="Счёт / карта / ИНН / БИК"></textarea>
 
       <label>Назначение платежа <span class="req">*</span></label>
       <textarea name="purpose" placeholder="За что платёж" required></textarea>
@@ -2019,7 +2019,7 @@ def payment_submit_route():
         requester_id = (form.get("requester_id") or "").strip()
         is_urgent    = urgency == "Срочный"
 
-        if not (amount and category and recipient and requisites and purpose
+        if not (amount and category and recipient and purpose
                 and payer_id and requester_id):
             return _render_payment_result(False, "Заполнены не все обязательные поля")
 
@@ -2036,7 +2036,7 @@ def payment_submit_route():
         # Запись в Google Sheets
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         append_payment_request_row([
-            now, requester_name, category, amount, recipient, requisites,
+            now, requester_name, category, amount, recipient, requisites or "—",
             purpose, due_date or "—", urgency, payer_name, file_link or "—", "Новая",
         ])
 
@@ -2052,7 +2052,7 @@ def payment_submit_route():
                 f"📂 Категория: {category}",
                 f"🚦 Срочность: {'🔴 СРОЧНЫЙ' if is_urgent else '🟢 Не срочный'}",
                 f"🏦 Получатель: {recipient}",
-                f"💳 Реквизиты: {requisites}",
+                f"💳 Реквизиты: {requisites or '—'}",
                 f"📝 Назначение: {purpose}",
                 f"📅 Срок оплаты: {due_date or '—'}",
             ]
