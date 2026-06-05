@@ -2,6 +2,7 @@ import os
 import io
 import json
 import time
+import uuid
 import base64
 import threading
 import requests
@@ -537,12 +538,14 @@ def init_sheets():
     # Заголовок Заявки — журнал заявок на оплату
     service.spreadsheets().values().update(
         spreadsheetId=SHEET_ID,
-        range="Заявки!A1:L1",
+        range="Заявки!A1:O1",
         valueInputOption="RAW",
         body={"values": [[
             "Дата создания", "Заявитель", "Категория", "Сумма",
             "Получатель", "Реквизиты", "Назначение платежа",
             "Срок оплаты", "Срочность", "Плательщик", "Файл счёта", "Статус",
+            # Технические поля для отмены заявки из чата (можно скрыть колонки).
+            "ID заявки", "ID заявителя", "ID сообщения",
         ]]},
     ).execute()
 
@@ -916,18 +919,48 @@ def extract_uploader_name(data):
     return fallback if fallback else "Неизвестно"
 
 
-def send_message(dialog_id, text):
+def send_message(dialog_id, text, keyboard=None):
+    """Отправляет сообщение ботом. Возвращает ID сообщения (int) или None.
+
+    keyboard — необязательный список кнопок (формат Bitrix imbot KEYBOARD),
+    например кнопка «Отменить заявку».
+    """
     if not dialog_id:
-        return
+        return None
     try:
         payload = {"DIALOG_ID": dialog_id, "MESSAGE": text, "CLIENT_ID": BOT_CLIENT_ID}
         # При вызове через входящий вебхук (вне контекста события) Битриксу
         # нужен ещё и BOT_ID, иначе он не знает, от чьего имени слать.
         if BITRIX_BOT_ID:
             payload["BOT_ID"] = BITRIX_BOT_ID
-        bitrix_post("imbot.message.add", payload, timeout=15)
+        if keyboard:
+            payload["KEYBOARD"] = keyboard
+        resp = bitrix_post("imbot.message.add", payload, timeout=15)
+        try:
+            return resp.json().get("result")
+        except Exception:
+            return None
     except Exception as e:
         print(f"send_message error: {e}")
+        return None
+
+
+def update_bot_message(message_id, text):
+    """Редактирует ранее отправленное ботом сообщение и убирает у него кнопки."""
+    if not message_id:
+        return
+    try:
+        payload = {
+            "MESSAGE_ID": message_id,
+            "MESSAGE": text,
+            "CLIENT_ID": BOT_CLIENT_ID,
+            "KEYBOARD": "N",  # убрать кнопки
+        }
+        if BITRIX_BOT_ID:
+            payload["BOT_ID"] = BITRIX_BOT_ID
+        bitrix_post("imbot.message.update", payload, timeout=15)
+    except Exception as e:
+        print(f"update_bot_message error: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -1734,13 +1767,50 @@ def append_payment_request_row(row):
         service = get_sheets_service()
         service.spreadsheets().values().append(
             spreadsheetId=SHEET_ID,
-            range="Заявки!A:L",
+            range="Заявки!A:O",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body={"values": [row]},
         ).execute()
     except Exception as e:
         print(f"append_payment_request_row error: {e}")
+
+
+# Колонки листа «Заявки» (0-based): L=Статус(11), M=ID заявки(12),
+# N=ID заявителя(13), O=ID сообщения(14).
+def find_payment_row_by_rid(rid):
+    """Ищет заявку по ID (колонка M). Возвращает (row_number, values) или (None, None).
+
+    row_number — 1-based номер строки в листе (для адресации диапазонов).
+    """
+    rid = (rid or "").strip()
+    if not rid:
+        return None, None
+    try:
+        service = get_sheets_service()
+        rows = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range="Заявки!A2:O"
+        ).execute().get("values", [])
+        for i, r in enumerate(rows):
+            if len(r) > 12 and (r[12] or "").strip() == rid:
+                return i + 2, r  # +2: строки начинаются с 1, данные — со 2-й
+    except Exception as e:
+        print(f"find_payment_row_by_rid error: {e}")
+    return None, None
+
+
+def set_payment_status(row_number, status):
+    """Проставляет статус (колонка L) для заявки в указанной строке."""
+    try:
+        service = get_sheets_service()
+        service.spreadsheets().values().update(
+            spreadsheetId=SHEET_ID,
+            range=f"Заявки!L{row_number}",
+            valueInputOption="RAW",
+            body={"values": [[status]]},
+        ).execute()
+    except Exception as e:
+        print(f"set_payment_status error: {e}")
 
 
 def _render_payment_form(users, categories, error=None):
@@ -2035,15 +2105,13 @@ def payment_submit_route():
             content = f.read()
             file_link = upload_invoice_to_disk(f.filename, content)
 
-        # Запись в Google Sheets
-        now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        append_payment_request_row([
-            now, requester_name, category, amount, recipient, requisites or "—",
-            purpose, due_date or "—", urgency, payer_name, file_link or "—", "Новая",
-        ])
+        # Уникальный ID заявки — связывает строку таблицы, сообщение в чате
+        # и кнопку «Отменить».
+        rid = uuid.uuid4().hex[:12]
 
         # Уведомление в чат «Платежи» с упоминанием плательщика.
         # Все заявки (и Чермен, и Анастасия) идут в один общий PAYMENT_CHAT_ID.
+        message_id = None
         if PAYMENT_CHAT_ID:
             header = ("🔴 [B]СРОЧНАЯ заявка на оплату[/B] 🔴" if is_urgent
                       else "🧾 [B]Новая заявка на оплату[/B]")
@@ -2062,14 +2130,162 @@ def payment_submit_route():
                 lines.append(f"📎 Счёт: {file_link}")
             lines.append("")
             lines.append(f"[USER={payer_id}]{payer_name}[/USER], нужно оплатить 🙏")
-            send_message(PAYMENT_CHAT_ID, "\n".join(lines))
+            # Кнопка отмены: открывает страницу /pay/cancel, где заявитель
+            # подтверждает отмену (проверка автора через BX24).
+            keyboard = [{
+                "TEXT": "❌ Отменить заявку",
+                "LINK": f"{APP_PUBLIC_URL}/pay/cancel?rid={rid}",
+                "BG_COLOR": "#eb5757",
+                "TEXT_COLOR": "#ffffff",
+                "DISPLAY": "LINE",
+            }]
+            message_id = send_message(PAYMENT_CHAT_ID, "\n".join(lines), keyboard=keyboard)
         else:
             print("PAYMENT_CHAT_ID не задан — уведомление в чат не отправлено")
+
+        # Запись в Google Sheets (вместе с техн. полями для отмены).
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        append_payment_request_row([
+            now, requester_name, category, amount, recipient, requisites or "—",
+            purpose, due_date or "—", urgency, payer_name, file_link or "—", "Новая",
+            rid, requester_id, str(message_id or ""),
+        ])
 
         return _render_payment_result(True, "Заявка создана и отправлена на оплату")
     except Exception as e:
         print(f"payment_submit_route error: {e}")
         return _render_payment_result(False, "Не удалось создать заявку. Попробуйте ещё раз.")
+
+
+@app.route("/pay/cancel", methods=["GET"])
+def payment_cancel_route():
+    """Страница отмены заявки (открывается по кнопке в чате).
+
+    Определяет текущего пользователя через BX24 (user.current) и отправляет
+    подтверждение на /pay/cancel/confirm. Отменить может только заявитель.
+    """
+    rid = (request.args.get("rid") or "").strip()
+    return Response(
+        f"""<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Отмена заявки</title>
+<script src="//api.bitrix24.com/api/v1/"></script>
+<style>
+  body {{ font-family:system-ui,Arial,sans-serif; background:#eef2f4; margin:0; padding:24px; color:#1e2734; }}
+  .card {{ max-width:440px; margin:32px auto; background:#fff; border-radius:14px;
+           padding:28px 24px; text-align:center; box-shadow:0 2px 10px rgba(31,49,71,.08); }}
+  .ic {{ font-size:46px; }}
+  h2 {{ margin:14px 0 6px; font-size:19px; }}
+  p {{ color:#5b6b7d; font-size:14px; margin:8px 0; }}
+  .spin {{ color:#7d8a99; }}
+</style></head>
+<body>
+<div class="card">
+  <div class="ic" id="ic">⏳</div>
+  <h2 id="title">Отмена заявки…</h2>
+  <p id="msg" class="spin">Определяем пользователя…</p>
+</div>
+<script>
+  var RID = {json.dumps(rid)};
+  function show(ic, title, msg) {{
+    document.getElementById('ic').textContent = ic;
+    document.getElementById('title').textContent = title;
+    document.getElementById('msg').textContent = msg;
+  }}
+  function doConfirm(uid) {{
+    var fd = new FormData();
+    fd.append('rid', RID);
+    fd.append('user_id', uid || '');
+    fetch('/pay/cancel/confirm', {{ method:'POST', body:fd }})
+      .then(function(r) {{ return r.json(); }})
+      .then(function(d) {{
+        if (d.ok) {{ show('✅', 'Заявка отменена', d.message || ''); }}
+        else {{ show('⚠️', 'Не отменено', d.message || 'Ошибка'); }}
+        try {{ if (window.BX24) BX24.fitWindow(); }} catch(e) {{}}
+      }})
+      .catch(function() {{ show('⚠️', 'Ошибка', 'Не удалось связаться с сервером'); }});
+  }}
+  try {{
+    if (window.BX24) {{
+      BX24.init(function() {{
+        try {{ BX24.fitWindow(); }} catch(e) {{}}
+        BX24.callMethod('user.current', {{}}, function(res) {{
+          if (res.error()) {{ show('⚠️','Ошибка','Не удалось определить пользователя'); return; }}
+          var u = res.data();
+          doConfirm(u && u.ID ? u.ID : '');
+        }});
+      }});
+    }} else {{
+      show('⚠️','Откройте из Битрикса','Кнопку отмены нужно нажимать внутри Битрикс24.');
+    }}
+  }} catch(e) {{ show('⚠️','Ошибка', String(e)); }}
+</script>
+</body></html>""",
+        mimetype="text/html; charset=utf-8",
+    )
+
+
+@app.route("/pay/cancel/confirm", methods=["POST"])
+def payment_cancel_confirm_route():
+    """Выполняет отмену заявки: проверяет автора, ставит статус, правит сообщение."""
+    try:
+        rid = (request.form.get("rid") or "").strip()
+        user_id = (request.form.get("user_id") or "").strip()
+        if not rid:
+            return jsonify({"ok": False, "message": "Не указан ID заявки"})
+
+        row_number, values = find_payment_row_by_rid(rid)
+        if not row_number:
+            return jsonify({"ok": False, "message": "Заявка не найдена"})
+
+        status        = (values[11] if len(values) > 11 else "").strip()
+        requester_id  = (values[13] if len(values) > 13 else "").strip()
+        message_id    = (values[14] if len(values) > 14 else "").strip()
+        requester_nm  = (values[1] if len(values) > 1 else "").strip()
+        amount        = (values[3] if len(values) > 3 else "").strip()
+        recipient     = (values[4] if len(values) > 4 else "").strip()
+        category      = (values[2] if len(values) > 2 else "").strip()
+
+        if status == "Отменена":
+            return jsonify({"ok": False, "message": "Заявка уже отменена"})
+
+        # Отменить может только автор заявки.
+        if not user_id or str(user_id) != str(requester_id):
+            return jsonify({
+                "ok": False,
+                "message": f"Отменить может только заявитель ({requester_nm})",
+            })
+
+        set_payment_status(row_number, "Отменена")
+
+        # Правим сообщение в чате — помечаем отменённым и убираем кнопку.
+        if message_id:
+            cancelled = "\n".join([
+                "❌ [B]ЗАЯВКА ОТМЕНЕНА[/B]",
+                f"👤 Заявитель: {requester_nm}",
+                f"💰 Сумма: {amount}",
+                f"📂 Категория: {category}",
+                f"🏦 Получатель: {recipient}",
+                "",
+                "[I]Отменена заявителем[/I]",
+            ])
+            update_bot_message(message_id, cancelled)
+
+        # Отдельное уведомление в чат «Платежи» об отмене.
+        if PAYMENT_CHAT_ID:
+            send_message(PAYMENT_CHAT_ID, "\n".join([
+                "❌ [B]Заявка отменена[/B]",
+                f"👤 Заявитель: {requester_nm}",
+                f"💰 Сумма: {amount}",
+                f"🏦 Получатель: {recipient}",
+                f"📂 Категория: {category}",
+            ]))
+
+        return jsonify({"ok": True, "message": "Заявка помечена как отменённая"})
+    except Exception as e:
+        print(f"payment_cancel_confirm_route error: {e}")
+        return jsonify({"ok": False, "message": "Внутренняя ошибка"})
 
 
 @app.route("/categories", methods=["GET"])
