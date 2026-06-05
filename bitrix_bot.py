@@ -1186,6 +1186,45 @@ def get_pdf_bytes(file_id, fallback_url=None, auth=None):
 # Claude AI
 # ─────────────────────────────────────────────
 
+def is_bank_statement(pdf_bytes):
+    """Спрашивает у ИИ, является ли PDF банковской выпиской.
+
+    Нужно для чата «Платежи»: туда кидают чеки и платёжки, которые НЕ надо
+    разносить как выписку. Возвращает True только если это похоже на
+    банковскую выписку со списком операций. При ошибке — False (молчим).
+    """
+    if not ANTHROPIC_API_KEY:
+        return False
+    try:
+        pdf_b64 = base64.b64encode(pdf_bytes).decode()
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=10,
+            system=(
+                "Определи тип документа в PDF. Ответь ОДНИМ словом без знаков:\n"
+                "STATEMENT — если это банковская ВЫПИСКА по счёту/карте "
+                "(перечень операций за период).\n"
+                "OTHER — если это что-то другое: чек, квитанция, платёжное "
+                "поручение, счёт на оплату, договор и т.п."
+            ),
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64}},
+                    {"type": "text", "text": "Это банковская выписка? STATEMENT или OTHER."},
+                ],
+            }],
+        )
+        answer = "".join(
+            b.text for b in resp.content if getattr(b, "type", "") == "text"
+        ).strip().upper()
+        print(f"is_bank_statement → {answer!r}")
+        return "STATEMENT" in answer
+    except Exception as e:
+        print(f"is_bank_statement error: {e}")
+        return False
+
+
 def extract_transactions(pdf_bytes):
     if not ANTHROPIC_API_KEY:
         raise ValueError("Не указан ANTHROPIC_API_KEY")
@@ -1279,8 +1318,24 @@ def extract_transactions(pdf_bytes):
 # Фоновая обработка
 # ─────────────────────────────────────────────
 
-def process_pdf_async(dialog_id, file_id, fallback_url, uploader="", auth=None):
+def process_pdf_async(dialog_id, file_id, fallback_url, uploader="", auth=None,
+                      require_statement_check=False):
     try:
+        # В чате «Платежи» сначала качаем файл и проверяем, выписка ли это.
+        # Если нет (чек/платёжка/счёт) — молча выходим, ничего не пишем.
+        if require_statement_check:
+            try:
+                pdf_bytes = get_pdf_bytes(file_id, fallback_url=fallback_url, auth=auth)
+            except Exception as e:
+                print(f"process_pdf_async: download failed (payment chat), silent: {e}")
+                return
+            if not is_bank_statement(pdf_bytes):
+                print("Платежи: PDF не похож на выписку — пропускаем молча")
+                return
+            send_message(dialog_id, "📄 Получил выписку, начинаю обработку...")
+        else:
+            pdf_bytes = None
+
         # Проверяем все сервисы перед обработкой
         problems = check_all_services()
         if problems:
@@ -1289,7 +1344,8 @@ def process_pdf_async(dialog_id, file_id, fallback_url, uploader="", auth=None):
             send_message(dialog_id, msg)
             return
 
-        pdf_bytes = get_pdf_bytes(file_id, fallback_url=fallback_url, auth=auth)
+        if pdf_bytes is None:
+            pdf_bytes = get_pdf_bytes(file_id, fallback_url=fallback_url, auth=auth)
         send_message(dialog_id, "🔍 Анализирую выписку через ИИ...")
 
         account_owner, transactions = extract_transactions(pdf_bytes)
@@ -1445,11 +1501,10 @@ def bot_handler():
         or data.get("data[PARAMS][TO_CHAT_ID]")
     )
 
-    # В чате «Платежи» бот НЕ реагирует на сообщения/файлы: туда кидают чеки,
-    # платёжки и просьбы — это не банковские выписки, обрабатывать их не нужно.
-    # (Бот сам шлёт сюда уведомления о заявках, но на чужие сообщения молчит.)
-    if _is_payment_chat(dialog_id):
-        return jsonify({"result": "ok", "skipped": "payment_chat"})
+    # В чате «Платежи» бот не болтает: на текст/чеки/платёжки молчит. Но если
+    # туда прислали именно банковскую выписку — обрабатываем её как обычно.
+    # Тип PDF (выписка или нет) определяется в process_pdf_async через ИИ.
+    is_pay = _is_payment_chat(dialog_id)
 
     message_text = str(data.get("data[PARAMS][MESSAGE]", "")).strip().lower()
 
@@ -1490,13 +1545,21 @@ def bot_handler():
         # Достаём auth-токен пользователя из события — нужен для скачивания
         # файлов, загруженных НЕ владельцем вебхука (см. get_pdf_bytes).
         auth = parse_auth_from_event(data)
-        send_message(dialog_id, "📄 Получил PDF, начинаю обработку...")
+        # В «Платежах» не анонсируем приём сразу — сначала ИИ проверит, выписка
+        # ли это (иначе на чек бот бы написал «Получил PDF…»).
+        if not is_pay:
+            send_message(dialog_id, "📄 Получил PDF, начинаю обработку...")
         thread = threading.Thread(
             target=process_pdf_async,
             args=(dialog_id, file_id, fallback_url, uploader, auth),
+            kwargs={"require_statement_check": is_pay},
             daemon=True,
         )
         thread.start()
+
+    elif is_pay:
+        # В чате «Платежи» на текст/чеки/прочее без выписки — молчим.
+        return jsonify({"result": "ok", "skipped": "payment_chat_no_statement"})
 
     elif is_help_query(message_text):
         # Полная инструкция: «инструкция / помощь / help / команды / что ты умеешь / возможности»
