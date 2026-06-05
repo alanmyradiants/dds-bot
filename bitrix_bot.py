@@ -945,6 +945,18 @@ def send_message(dialog_id, text, keyboard=None):
         return None
 
 
+def _is_payment_chat(dialog_id):
+    """True, если диалог — это чат «Платежи» (PAYMENT_CHAT_ID).
+
+    Сравниваем по номеру чата, т.к. Битрикс шлёт DIALOG_ID как "chat242",
+    а TO_CHAT_ID — как "242".
+    """
+    if not dialog_id or not PAYMENT_CHAT_ID:
+        return False
+    norm = lambda x: str(x).lower().replace("chat", "").strip()
+    return norm(dialog_id) == norm(PAYMENT_CHAT_ID)
+
+
 def update_bot_message(message_id, text):
     """Редактирует ранее отправленное ботом сообщение и убирает у него кнопки."""
     if not message_id:
@@ -1432,6 +1444,13 @@ def bot_handler():
         data.get("data[PARAMS][DIALOG_ID]")
         or data.get("data[PARAMS][TO_CHAT_ID]")
     )
+
+    # В чате «Платежи» бот НЕ реагирует на сообщения/файлы: туда кидают чеки,
+    # платёжки и просьбы — это не банковские выписки, обрабатывать их не нужно.
+    # (Бот сам шлёт сюда уведомления о заявках, но на чужие сообщения молчит.)
+    if _is_payment_chat(dialog_id):
+        return jsonify({"result": "ok", "skipped": "payment_chat"})
+
     message_text = str(data.get("data[PARAMS][MESSAGE]", "")).strip().lower()
 
     file_info = find_pdf_in_payload(data)
