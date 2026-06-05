@@ -31,6 +31,11 @@ APP_PUBLIC_URL           = os.getenv("APP_PUBLIC_URL", "https://dds-bot-producti
 DISK_TOKEN = BITRIX_DISK_WEBHOOK_URL.rstrip("/").split("/")[-1]
 SHEET_URL  = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 
+# DIALOG_ID общего чата, куда бот шлёт уведомления о новых заявках на оплату.
+# Формат: "chat123" (для группового чата) или числовой ID пользователя.
+# Узнать ID чата можно через im.recent.get / im.chat.get или из URL чата.
+PAYMENT_CHAT_ID = os.getenv("PAYMENT_CHAT_ID", "").strip()
+
 # ─────────────────────────────────────────────
 # Google Sheets credentials
 # ─────────────────────────────────────────────
@@ -459,7 +464,7 @@ def init_sheets():
     requests_body = []
 
     # Создаём листы если не существуют
-    for sheet_name in ["Транзакции", "Правила"]:
+    for sheet_name in ["Транзакции", "Правила", "Заявки"]:
         if sheet_name not in existing_sheets:
             requests_body.append({
                 "addSheet": {"properties": {"title": sheet_name}}
@@ -492,6 +497,18 @@ def init_sheets():
         valueInputOption="RAW",
         body={"values": [["Контрагент", "Категория", "Личное/Бизнес"]]}
     ).execute()
+    # Заголовок Заявки — журнал заявок на оплату
+    service.spreadsheets().values().update(
+        spreadsheetId=SHEET_ID,
+        range="Заявки!A1:J1",
+        valueInputOption="RAW",
+        body={"values": [[
+            "Дата создания", "Заявитель", "Категория", "Сумма",
+            "Получатель / реквизиты", "Назначение платежа",
+            "Срок оплаты", "Плательщик", "Файл счёта", "Статус",
+        ]]},
+    ).execute()
+
     print("✅ Таблица инициализирована")
     print("ℹ️ Правила заполнятся автоматически при загрузке PDF")
 
@@ -1414,6 +1431,305 @@ def init_sheets_route():
         return jsonify({"ok": True, "message": "Таблица инициализирована"})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
+
+
+# ─────────────────────────────────────────────
+# Заявки на оплату (Local Application)
+# ─────────────────────────────────────────────
+
+def bitrix_disk_post(method_name, payload, timeout=30):
+    url = f"{BITRIX_DISK_WEBHOOK_URL}/{method_name}.json"
+    return requests.post(url, json=payload, timeout=timeout)
+
+
+def fetch_active_users():
+    """Список активных сотрудников для выпадающего списка «Плательщик».
+
+    Возвращает список dict: {"id": int, "name": "Имя Фамилия"}.
+    Постранично тянет user.get (Битрикс отдаёт по 50 за раз).
+    """
+    users = []
+    start = 0
+    try:
+        while True:
+            resp = bitrix_post(
+                "user.get",
+                {"FILTER": {"ACTIVE": True}, "start": start},
+                timeout=20,
+            )
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+            for u in data.get("result", []) or []:
+                name = _combine_first_last(u.get("NAME"), u.get("LAST_NAME"))
+                if not name:
+                    name = (u.get("EMAIL") or f"ID {u.get('ID')}").strip()
+                users.append({"id": int(u["ID"]), "name": name})
+            nxt = data.get("next")
+            if nxt is None:
+                break
+            start = nxt
+    except Exception as e:
+        print(f"fetch_active_users error: {e}")
+    users.sort(key=lambda x: x["name"].lower())
+    return users
+
+
+def fetch_requester(access_token, client_endpoint):
+    """ФИО + ID сотрудника, открывшего приложение (по токену Local App)."""
+    if not access_token or not client_endpoint:
+        return {"id": None, "name": ""}
+    try:
+        resp = requests.post(
+            f"{client_endpoint.rstrip('/')}/user.current.json",
+            data={"auth": access_token},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            u = resp.json().get("result") or {}
+            if u:
+                name = _combine_first_last(u.get("NAME"), u.get("LAST_NAME"))
+                return {"id": u.get("ID"), "name": name or "Сотрудник"}
+    except Exception as e:
+        print(f"fetch_requester error: {e}")
+    return {"id": None, "name": ""}
+
+
+def upload_invoice_to_disk(filename, content_bytes):
+    """Загружает файл счёта на Bitrix-диск, возвращает ссылку для просмотра.
+
+    Использует первое доступное хранилище (disk.storage.getlist) и
+    кладёт файл в его корень через disk.storage.uploadfile.
+    При любой ошибке возвращает "" — заявка всё равно создастся.
+    """
+    if not content_bytes:
+        return ""
+    try:
+        resp = bitrix_disk_post("disk.storage.getlist", {})
+        storages = (resp.json().get("result") or []) if resp.status_code == 200 else []
+        if not storages:
+            print("upload_invoice_to_disk: нет доступных хранилищ диска")
+            return ""
+        storage_id = storages[0]["ID"]
+
+        b64 = base64.b64encode(content_bytes).decode("ascii")
+        up = bitrix_disk_post(
+            "disk.storage.uploadfile",
+            {
+                "id": storage_id,
+                "data": {"NAME": filename},
+                "fileContent": [filename, b64],
+                "generateUniqueName": True,
+            },
+            timeout=60,
+        )
+        if up.status_code != 200:
+            print(f"upload_invoice_to_disk status={up.status_code} body={safe_preview(up.text,300)}")
+            return ""
+        f = up.json().get("result") or {}
+        return f.get("DETAIL_URL") or f.get("DOWNLOAD_URL") or ""
+    except Exception as e:
+        print(f"upload_invoice_to_disk error: {e}")
+        return ""
+
+
+def append_payment_request_row(row):
+    """Добавляет строку заявки на оплату в лист «Заявки»."""
+    try:
+        service = get_sheets_service()
+        service.spreadsheets().values().append(
+            spreadsheetId=SHEET_ID,
+            range="Заявки!A:J",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row]},
+        ).execute()
+    except Exception as e:
+        print(f"append_payment_request_row error: {e}")
+
+
+def _render_payment_form(requester, users, error=None):
+    """HTML-форма создания заявки на оплату (открывается как Local App)."""
+    cat_options = "\n".join(
+        f'<option value="{c}">{c}</option>' for c in DDS_CATEGORIES
+    )
+    user_options = "\n".join(
+        f'<option value="{u["id"]}">{u["name"]}</option>' for u in users
+    )
+    err_html = (
+        f'<div class="err">⚠️ {error}</div>' if error else ""
+    )
+    requester_name = requester.get("name") or ""
+    requester_id = requester.get("id") or ""
+    return Response(
+        f"""<!DOCTYPE html>
+<html lang="ru"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Заявка на оплату</title>
+<style>
+  * {{ box-sizing: border-box; }}
+  body {{ font-family: system-ui, -apple-system, sans-serif; margin:0; padding:16px;
+         background:#f4f6f8; color:#222; }}
+  .card {{ max-width:560px; margin:0 auto; background:#fff; border-radius:12px;
+           padding:24px; box-shadow:0 1px 4px rgba(0,0,0,.08); }}
+  h1 {{ font-size:20px; margin:0 0 4px; }}
+  .sub {{ color:#888; font-size:13px; margin:0 0 20px; }}
+  label {{ display:block; font-size:13px; font-weight:600; margin:14px 0 5px; }}
+  input, select, textarea {{ width:100%; padding:10px 12px; font-size:15px;
+           border:1px solid #d0d5dd; border-radius:8px; background:#fff; }}
+  textarea {{ resize:vertical; min-height:64px; }}
+  button {{ width:100%; margin-top:22px; padding:13px; font-size:16px; font-weight:600;
+           color:#fff; background:#2563eb; border:0; border-radius:8px; cursor:pointer; }}
+  button:hover {{ background:#1d4ed8; }}
+  button:disabled {{ background:#9bb4e8; cursor:default; }}
+  .err {{ background:#fde8e8; color:#b42318; padding:10px 12px; border-radius:8px;
+          font-size:14px; margin-bottom:12px; }}
+  .req {{ color:#b42318; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🧾 Заявка на оплату</h1>
+  <p class="sub">Заполните поля — ответственный за оплату получит уведомление в чат.</p>
+  {err_html}
+  <form method="POST" action="/pay/submit" enctype="multipart/form-data"
+        onsubmit="this.querySelector('button').disabled=true;this.querySelector('button').textContent='Отправляем…';">
+    <input type="hidden" name="requester_name" value="{requester_name}">
+    <input type="hidden" name="requester_id" value="{requester_id}">
+
+    <label>Сумма <span class="req">*</span></label>
+    <input type="text" name="amount" inputmode="decimal" placeholder="например, 15000" required>
+
+    <label>Категория <span class="req">*</span></label>
+    <select name="category" required>{cat_options}</select>
+
+    <label>Получатель / реквизиты <span class="req">*</span></label>
+    <textarea name="recipient" placeholder="Кому платим: название, счёт/карта, ИНН" required></textarea>
+
+    <label>Назначение платежа <span class="req">*</span></label>
+    <textarea name="purpose" placeholder="За что платёж" required></textarea>
+
+    <label>Срок оплаты</label>
+    <input type="date" name="due_date">
+
+    <label>Кто оплачивает <span class="req">*</span></label>
+    <select name="payer_id" required>
+      <option value="" disabled selected>— выберите сотрудника —</option>
+      {user_options}
+    </select>
+
+    <label>Файл счёта</label>
+    <input type="file" name="invoice" accept=".pdf,.jpg,.jpeg,.png">
+
+    <button type="submit">Создать заявку</button>
+  </form>
+</div>
+</body></html>""",
+        mimetype="text/html; charset=utf-8",
+    )
+
+
+def _render_payment_result(ok, message):
+    color = "#16a34a" if ok else "#b42318"
+    icon = "✅" if ok else "❌"
+    return Response(
+        f"""<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Заявка на оплату</title></head>
+<body style="font-family:system-ui,sans-serif;background:#f4f6f8;margin:0;padding:24px;">
+<div style="max-width:480px;margin:40px auto;background:#fff;border-radius:12px;padding:32px;text-align:center;box-shadow:0 1px 4px rgba(0,0,0,.08);">
+  <div style="font-size:48px;">{icon}</div>
+  <h2 style="color:{color};margin:12px 0;">{message}</h2>
+  <a href="/pay" style="display:inline-block;margin-top:8px;color:#2563eb;text-decoration:none;font-weight:600;">← Создать ещё одну</a>
+</div>
+</body></html>""",
+        mimetype="text/html; charset=utf-8",
+    )
+
+
+@app.route("/pay", methods=["GET", "POST"])
+def payment_form_route():
+    """Local Application: форма создания заявки на оплату."""
+    # Bitrix открывает Local App через POST с AUTH-параметрами.
+    data = parse_request_data()
+    auth = parse_auth_from_event(data)
+    access_token = auth.get("access_token") or data.get("AUTH_ID")
+    client_endpoint = (
+        auth.get("client_endpoint")
+        or derive_client_endpoint(auth.get("domain"))
+    )
+    requester = fetch_requester(access_token, client_endpoint)
+    users = fetch_active_users()
+    return _render_payment_form(requester, users)
+
+
+@app.route("/pay/submit", methods=["POST"])
+def payment_submit_route():
+    """Приём заявки: загрузка счёта, запись в Sheets, уведомление в чат."""
+    try:
+        form = request.form
+        amount    = (form.get("amount") or "").strip()
+        category  = (form.get("category") or "").strip()
+        recipient = (form.get("recipient") or "").strip()
+        purpose   = (form.get("purpose") or "").strip()
+        due_date  = (form.get("due_date") or "").strip()
+        payer_id  = (form.get("payer_id") or "").strip()
+        requester_name = (form.get("requester_name") or "").strip() or "Сотрудник"
+
+        if not (amount and category and recipient and purpose and payer_id):
+            return _render_payment_result(False, "Заполнены не все обязательные поля")
+
+        # Имя плательщика (для текста сообщения и таблицы)
+        payer_name = ""
+        try:
+            r = bitrix_post("user.get", {"ID": payer_id}, timeout=10)
+            res = (r.json().get("result") or []) if r.status_code == 200 else []
+            if res:
+                payer_name = _combine_first_last(res[0].get("NAME"), res[0].get("LAST_NAME"))
+        except Exception as e:
+            print(f"payment_submit user.get error: {e}")
+        if not payer_name:
+            payer_name = f"ID {payer_id}"
+
+        # Файл счёта → Bitrix Drive
+        file_link = ""
+        f = request.files.get("invoice")
+        if f and f.filename:
+            content = f.read()
+            file_link = upload_invoice_to_disk(f.filename, content)
+
+        # Запись в Google Sheets
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        append_payment_request_row([
+            now, requester_name, category, amount, recipient,
+            purpose, due_date or "—", payer_name, file_link or "—", "Новая",
+        ])
+
+        # Уведомление в общий чат с упоминанием плательщика
+        if PAYMENT_CHAT_ID:
+            lines = [
+                "🧾 [B]Новая заявка на оплату[/B]",
+                f"👤 Заявитель: {requester_name}",
+                f"💰 Сумма: {amount}",
+                f"📂 Категория: {category}",
+                f"🏦 Получатель: {recipient}",
+                f"📝 Назначение: {purpose}",
+                f"📅 Срок оплаты: {due_date or '—'}",
+            ]
+            if file_link:
+                lines.append(f"📎 Счёт: {file_link}")
+            lines.append("")
+            lines.append(f"[USER={payer_id}]{payer_name}[/USER], нужно оплатить 🙏")
+            send_message(PAYMENT_CHAT_ID, "\n".join(lines))
+        else:
+            print("PAYMENT_CHAT_ID не задан — уведомление в чат не отправлено")
+
+        return _render_payment_result(True, "Заявка создана и отправлена на оплату")
+    except Exception as e:
+        print(f"payment_submit_route error: {e}")
+        return _render_payment_result(False, "Не удалось создать заявку. Попробуйте ещё раз.")
 
 
 # ─────────────────────────────────────────────
