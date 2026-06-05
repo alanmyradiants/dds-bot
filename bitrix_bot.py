@@ -36,6 +36,10 @@ SHEET_URL  = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 # Узнать ID чата можно через im.recent.get / im.chat.get или из URL чата.
 PAYMENT_CHAT_ID = os.getenv("PAYMENT_CHAT_ID", "").strip()
 
+# BOT_ID чат-бота (из конструктора чат-бота). Нужен для imbot.message.add
+# при вызове через входящий вебхук — иначе Битрикс не знает, от кого слать.
+BITRIX_BOT_ID = os.getenv("BITRIX_BOT_ID", "").strip()
+
 # ─────────────────────────────────────────────
 # Google Sheets credentials
 # ─────────────────────────────────────────────
@@ -857,11 +861,12 @@ def send_message(dialog_id, text):
     if not dialog_id:
         return
     try:
-        bitrix_post(
-            "imbot.message.add",
-            {"DIALOG_ID": dialog_id, "MESSAGE": text, "CLIENT_ID": BOT_CLIENT_ID},
-            timeout=15,
-        )
+        payload = {"DIALOG_ID": dialog_id, "MESSAGE": text, "CLIENT_ID": BOT_CLIENT_ID}
+        # При вызове через входящий вебхук (вне контекста события) Битриксу
+        # нужен ещё и BOT_ID, иначе он не знает, от чьего имени слать.
+        if BITRIX_BOT_ID:
+            payload["BOT_ID"] = BITRIX_BOT_ID
+        bitrix_post("imbot.message.add", payload, timeout=15)
     except Exception as e:
         print(f"send_message error: {e}")
 
