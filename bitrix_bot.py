@@ -1733,20 +1733,29 @@ def _render_payment_form(users, categories, error=None):
     user_options = "\n".join(
         f'<option value="{u["id"]}">{u["name"]}</option>' for u in users
     )
-    # Опции для «Кто оплачивает» с предвыбором плательщика по умолчанию.
+    # Плательщик фиксирован (ответственный по умолчанию). Ищем его в списке.
     default_match = PAYMENT_DEFAULT_PAYER_NAME.lower()
-    payer_matched = False
-    payer_options = ""
-    for u in users:
-        sel = ""
-        if default_match and default_match in u["name"].lower() and not payer_matched:
-            sel = " selected"
-            payer_matched = True
-        payer_options += f'<option value="{u["id"]}"{sel}>{u["name"]}</option>\n'
-    payer_placeholder = (
-        "" if payer_matched
-        else '<option value="" disabled selected>— выберите сотрудника —</option>'
+    payer_default = next(
+        (u for u in users if default_match and default_match in u["name"].lower()),
+        None,
     )
+    if payer_default:
+        # Заблокированное поле + скрытый payer_id — менять нельзя.
+        payer_field = (
+            f'<input type="text" value="{payer_default["name"]}" readonly '
+            f'style="background:#f4f6f8;cursor:not-allowed;">'
+            f'<input type="hidden" name="payer_id" value="{payer_default["id"]}">'
+        )
+    else:
+        # Ответственный не найден в списке — даём выбрать вручную (фолбэк).
+        opts = "\n".join(
+            f'<option value="{u["id"]}">{u["name"]}</option>' for u in users
+        )
+        payer_field = (
+            '<select name="payer_id" required>'
+            '<option value="" disabled selected>— выберите сотрудника —</option>'
+            f'{opts}</select>'
+        )
     err_html = (
         f'<div class="err">⚠️ {error}</div>' if error else ""
     )
@@ -1849,10 +1858,7 @@ def _render_payment_form(users, categories, error=None):
       <textarea name="purpose" placeholder="За что платёж" required></textarea>
 
       <label>Кто оплачивает <span class="req">*</span> <span class="hint">— получит уведомление в чат</span></label>
-      <select name="payer_id" required>
-        {payer_placeholder}
-        {payer_options}
-      </select>
+      {payer_field}
 
       <label>Файл счёта <span class="hint">(PDF или фото)</span></label>
       <div class="file"><input type="file" name="invoice" accept=".pdf,.jpg,.jpeg,.png" style="border:0;padding:0;background:transparent;"></div>
