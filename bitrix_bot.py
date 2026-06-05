@@ -31,30 +31,11 @@ APP_PUBLIC_URL           = os.getenv("APP_PUBLIC_URL", "https://dds-bot-producti
 DISK_TOKEN = BITRIX_DISK_WEBHOOK_URL.rstrip("/").split("/")[-1]
 SHEET_URL  = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 
-# DIALOG_ID общего чата, куда бот шлёт уведомления о новых заявках на оплату.
-# Формат: "chat123" (для группового чата) или числовой ID пользователя.
-# Узнать ID чата можно через im.recent.get / im.chat.get или из URL чата.
+# DIALOG_ID чата «Платежи» — ВСЕ заявки на оплату падают сюда, независимо от
+# плательщика (и Чермен, и Анастасия). Конкретный плательщик тегается внутри
+# чата через [USER=id]. Формат: "chatNNN" или числовой ID пользователя.
+# Узнать ID чата можно через /chats (im.recent.get) или из URL чата.
 PAYMENT_CHAT_ID = os.getenv("PAYMENT_CHAT_ID", "").strip()
-
-# Маршрутизация уведомлений по плательщику: подстрока ФИО → DIALOG_ID чата.
-# Если плательщик подходит под ключ и для него задан чат — заявка уходит туда,
-# иначе в общий PAYMENT_CHAT_ID. Чат Анастасии задаётся env PAYMENT_CHAT_ID_ANASTASIA.
-PAYMENT_PAYER_CHATS = {
-    "Фаткуллина": os.getenv("PAYMENT_CHAT_ID_ANASTASIA", "").strip(),
-}
-
-
-def resolve_payment_chat(payer_name):
-    """DIALOG_ID чата для уведомления по имени плательщика.
-
-    Если для плательщика задан отдельный чат — возвращаем его, иначе общий
-    PAYMENT_CHAT_ID.
-    """
-    name = (payer_name or "").lower()
-    for key, chat_id in PAYMENT_PAYER_CHATS.items():
-        if chat_id and key.lower() in name:
-            return chat_id
-    return PAYMENT_CHAT_ID
 
 # BOT_ID чат-бота (из конструктора чат-бота). Нужен для imbot.message.add
 # при вызове через входящий вебхук — иначе Битрикс не знает, от кого слать.
@@ -2058,10 +2039,9 @@ def payment_submit_route():
             purpose, due_date or "—", urgency, payer_name, file_link or "—", "Новая",
         ])
 
-        # Уведомление в чат с упоминанием плательщика.
-        # Для отдельных плательщиков (напр. Анастасия) — их собственный чат.
-        notify_chat_id = resolve_payment_chat(payer_name)
-        if notify_chat_id:
+        # Уведомление в чат «Платежи» с упоминанием плательщика.
+        # Все заявки (и Чермен, и Анастасия) идут в один общий PAYMENT_CHAT_ID.
+        if PAYMENT_CHAT_ID:
             header = ("🔴 [B]СРОЧНАЯ заявка на оплату[/B] 🔴" if is_urgent
                       else "🧾 [B]Новая заявка на оплату[/B]")
             lines = [
@@ -2079,7 +2059,7 @@ def payment_submit_route():
                 lines.append(f"📎 Счёт: {file_link}")
             lines.append("")
             lines.append(f"[USER={payer_id}]{payer_name}[/USER], нужно оплатить 🙏")
-            send_message(notify_chat_id, "\n".join(lines))
+            send_message(PAYMENT_CHAT_ID, "\n".join(lines))
         else:
             print("PAYMENT_CHAT_ID не задан — уведомление в чат не отправлено")
 
