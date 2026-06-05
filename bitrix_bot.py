@@ -40,6 +40,10 @@ PAYMENT_CHAT_ID = os.getenv("PAYMENT_CHAT_ID", "").strip()
 # при вызове через входящий вебхук — иначе Битрикс не знает, от кого слать.
 BITRIX_BOT_ID = os.getenv("BITRIX_BOT_ID", "").strip()
 
+# Сотрудник-плательщик по умолчанию (подставляется в «Кто оплачивает»).
+# Сопоставляется по подстроке в ФИО — менять можно через env, не зная ID.
+PAYMENT_DEFAULT_PAYER_NAME = os.getenv("PAYMENT_DEFAULT_PAYER_NAME", "Кисиев").strip()
+
 # ─────────────────────────────────────────────
 # Google Sheets credentials
 # ─────────────────────────────────────────────
@@ -1729,6 +1733,20 @@ def _render_payment_form(users, categories, error=None):
     user_options = "\n".join(
         f'<option value="{u["id"]}">{u["name"]}</option>' for u in users
     )
+    # Опции для «Кто оплачивает» с предвыбором плательщика по умолчанию.
+    default_match = PAYMENT_DEFAULT_PAYER_NAME.lower()
+    payer_matched = False
+    payer_options = ""
+    for u in users:
+        sel = ""
+        if default_match and default_match in u["name"].lower() and not payer_matched:
+            sel = " selected"
+            payer_matched = True
+        payer_options += f'<option value="{u["id"]}"{sel}>{u["name"]}</option>\n'
+    payer_placeholder = (
+        "" if payer_matched
+        else '<option value="" disabled selected>— выберите сотрудника —</option>'
+    )
     err_html = (
         f'<div class="err">⚠️ {error}</div>' if error else ""
     )
@@ -1826,8 +1844,8 @@ def _render_payment_form(users, categories, error=None):
 
       <label>Кто оплачивает <span class="req">*</span> <span class="hint">— получит уведомление в чат</span></label>
       <select name="payer_id" required>
-        <option value="" disabled selected>— выберите сотрудника —</option>
-        {user_options}
+        {payer_placeholder}
+        {payer_options}
       </select>
 
       <label>Файл счёта <span class="hint">(PDF или фото)</span></label>
