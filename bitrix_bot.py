@@ -79,6 +79,22 @@ DDS_CATEGORIES = [
     "❓ Уточнить",
 ]
 
+# Категории именно для ЗАЯВОК НА ОПЛАТУ (форма /pay). Отдельно от DDS_CATEGORIES,
+# которые используются для разнесения PDF-выписок. Редактируются на /categories,
+# хранятся в листе «Категории заявок». Это — список по умолчанию / для сброса.
+PAYMENT_CATEGORIES_DEFAULT = [
+    "Зарплата",
+    "Коммунальные услуги",
+    "Займы",
+    "Фотосессия",
+    "Автоматизация",
+    "Логистика",
+    "Выкуп товара",
+    "Реклама у блогера",
+    "Самовыкуп",
+    "UGC-Блогеры",
+]
+
 # Встроенные правила (дополняются из вкладки "Правила")
 BUILTIN_RULES = {
     # Фотосессия (Бизнес)
@@ -530,9 +546,9 @@ def init_sheets():
             spreadsheetId=SHEET_ID,
             range="Категории заявок!A2",
             valueInputOption="RAW",
-            body={"values": [[c] for c in DDS_CATEGORIES]},
+            body={"values": [[c] for c in PAYMENT_CATEGORIES_DEFAULT]},
         ).execute()
-        print("ℹ️ Категории засеяны из DDS_CATEGORIES")
+        print("ℹ️ Категории засеяны из PAYMENT_CATEGORIES_DEFAULT")
 
     print("✅ Таблица инициализирована")
     print("ℹ️ Правила заполнятся автоматически при загрузке PDF")
@@ -1590,7 +1606,24 @@ def get_payment_categories():
             return cats
     except Exception as e:
         print(f"get_payment_categories error: {e}")
-    return list(DDS_CATEGORIES)
+    return list(PAYMENT_CATEGORIES_DEFAULT)
+
+
+def reset_payment_categories():
+    """Перезаписывает лист категорий стандартным списком PAYMENT_CATEGORIES_DEFAULT."""
+    try:
+        service = get_sheets_service()
+        service.spreadsheets().values().clear(
+            spreadsheetId=SHEET_ID, range="Категории заявок!A2:A",
+        ).execute()
+        service.spreadsheets().values().update(
+            spreadsheetId=SHEET_ID,
+            range="Категории заявок!A2",
+            valueInputOption="RAW",
+            body={"values": [[c] for c in PAYMENT_CATEGORIES_DEFAULT]},
+        ).execute()
+    except Exception as e:
+        print(f"reset_payment_categories error: {e}")
 
 
 def add_payment_category(name):
@@ -1978,6 +2011,13 @@ def categories_route():
       <input type="text" name="name" placeholder="Новая категория" required>
       <button>Добавить</button>
     </form>
+    <form method="POST" action="/categories/reset" style="margin-top:14px;"
+          onsubmit="return confirm('Заменить весь список стандартными категориями?');">
+      <button style="width:100%;padding:11px;border:0;border-radius:9px;cursor:pointer;
+                     background:#eef2f4;color:#7d8a99;font-size:14px;font-weight:600;">
+        ↻ Сбросить к стандартным
+      </button>
+    </form>
   </div>
 </div></body></html>"""
     return Response(html, mimetype="text/html; charset=utf-8")
@@ -1993,6 +2033,13 @@ def categories_add_route():
 @app.route("/categories/delete", methods=["POST"])
 def categories_delete_route():
     delete_payment_category(request.form.get("name"))
+    return Response('<meta http-equiv="refresh" content="0;url=/categories">',
+                    mimetype="text/html; charset=utf-8")
+
+
+@app.route("/categories/reset", methods=["POST"])
+def categories_reset_route():
+    reset_payment_categories()
     return Response('<meta http-equiv="refresh" content="0;url=/categories">',
                     mimetype="text/html; charset=utf-8")
 
