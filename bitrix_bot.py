@@ -35,7 +35,7 @@ SHEET_URL  = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 # плательщика (и Чермен, и Анастасия). Конкретный плательщик тегается внутри
 # чата через [USER=id]. Формат: "chatNNN" или числовой ID пользователя.
 # Узнать ID чата можно через /chats (im.recent.get) или из URL чата.
-PAYMENT_CHAT_ID = os.getenv("PAYMENT_CHAT_ID", "").strip()
+PAYMENT_CHAT_ID = os.getenv("PAYMENT_CHAT_ID", "chat242").strip()
 
 # BOT_ID чат-бота (из конструктора чат-бота). Нужен для imbot.message.add
 # при вызове через входящий вебхук — иначе Битрикс не знает, от кого слать.
