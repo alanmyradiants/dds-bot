@@ -1429,6 +1429,44 @@ def help_text_route():
     return Response(build_help_text(), mimetype="text/plain; charset=utf-8")
 
 
+@app.route("/chats", methods=["GET"])
+def chats_route():
+    """Список диалогов/чатов с их DIALOG_ID — чтобы найти PAYMENT_CHAT_ID.
+
+    Тянет im.recent.get через вебхук и выводит таблицу: название → ID.
+    Групповые чаты имеют ID вида chatXXX — его и нужно вписать в Railway.
+    """
+    try:
+        resp = bitrix_post("im.recent.get", {}, timeout=20)
+        items = (resp.json().get("result") or {}) if resp.status_code == 200 else {}
+        if isinstance(items, dict):
+            items = items.get("items", items)
+        rows = ""
+        for it in (items or []):
+            chat = it.get("chat") or {}
+            dialog_id = it.get("id") or chat.get("dialog_id") or ""
+            title = it.get("title") or chat.get("name") or "—"
+            kind = "👥 чат" if str(dialog_id).startswith("chat") else "👤 ЛС"
+            rows += (
+                f'<tr><td>{kind}</td><td>{title}</td>'
+                f'<td><code>{dialog_id}</code></td></tr>'
+            )
+        if not rows:
+            rows = '<tr><td colspan="3">Чатов не найдено (или нет прав im).</td></tr>'
+        html = f"""<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">
+<title>Чаты · поиск PAYMENT_CHAT_ID</title>
+<style>body{{font-family:system-ui,sans-serif;max-width:760px;margin:30px auto;padding:16px;}}
+table{{border-collapse:collapse;width:100%;}}td,th{{border:1px solid #ddd;padding:8px 10px;text-align:left;font-size:14px;}}
+th{{background:#f4f6f8;}}code{{background:#eef2f4;padding:2px 6px;border-radius:5px;}}</style></head>
+<body><h2>Чаты портала</h2>
+<p>Найди нужный <b>общий чат</b> и впиши его <code>ID</code> (вида <code>chat123</code>)
+в переменную <b>PAYMENT_CHAT_ID</b> в Railway.</p>
+<table><tr><th>Тип</th><th>Название</th><th>DIALOG_ID</th></tr>{rows}</table></body></html>"""
+        return Response(html, mimetype="text/html; charset=utf-8")
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
 @app.route("/init-sheets", methods=["GET"])
 def init_sheets_route():
     try:
