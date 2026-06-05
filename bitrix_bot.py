@@ -468,7 +468,7 @@ def init_sheets():
     requests_body = []
 
     # Создаём листы если не существуют
-    for sheet_name in ["Транзакции", "Правила", "Заявки"]:
+    for sheet_name in ["Транзакции", "Правила", "Заявки", "Категории заявок"]:
         if sheet_name not in existing_sheets:
             requests_body.append({
                 "addSheet": {"properties": {"title": sheet_name}}
@@ -504,14 +504,35 @@ def init_sheets():
     # Заголовок Заявки — журнал заявок на оплату
     service.spreadsheets().values().update(
         spreadsheetId=SHEET_ID,
-        range="Заявки!A1:J1",
+        range="Заявки!A1:K1",
         valueInputOption="RAW",
         body={"values": [[
             "Дата создания", "Заявитель", "Категория", "Сумма",
-            "Получатель / реквизиты", "Назначение платежа",
+            "Получатель", "Реквизиты", "Назначение платежа",
             "Срок оплаты", "Плательщик", "Файл счёта", "Статус",
         ]]},
     ).execute()
+
+    # Лист «Категории заявок» — источник списка категорий для формы.
+    # Заголовок ставим всегда, а сами категории засеиваем DDS_CATEGORIES
+    # только если лист ещё пустой (чтобы не затереть правки пользователя).
+    service.spreadsheets().values().update(
+        spreadsheetId=SHEET_ID,
+        range="Категории заявок!A1",
+        valueInputOption="RAW",
+        body={"values": [["Категория"]]},
+    ).execute()
+    existing = service.spreadsheets().values().get(
+        spreadsheetId=SHEET_ID, range="Категории заявок!A2:A"
+    ).execute().get("values", [])
+    if not existing:
+        service.spreadsheets().values().update(
+            spreadsheetId=SHEET_ID,
+            range="Категории заявок!A2",
+            valueInputOption="RAW",
+            body={"values": [[c] for c in DDS_CATEGORIES]},
+        ).execute()
+        print("ℹ️ Категории засеяны из DDS_CATEGORIES")
 
     print("✅ Таблица инициализирована")
     print("ℹ️ Правила заполнятся автоматически при загрузке PDF")
@@ -1538,6 +1559,82 @@ def fetch_requester(access_token, client_endpoint):
     return {"id": None, "name": ""}
 
 
+def resolve_user_name(user_id):
+    """ФИО сотрудника по его ID (через user.get). Фолбэк — 'ID N'."""
+    if not user_id:
+        return ""
+    try:
+        r = bitrix_post("user.get", {"ID": user_id}, timeout=10)
+        res = (r.json().get("result") or []) if r.status_code == 200 else []
+        if res:
+            name = _combine_first_last(res[0].get("NAME"), res[0].get("LAST_NAME"))
+            if name:
+                return name
+    except Exception as e:
+        print(f"resolve_user_name error: {e}")
+    return f"ID {user_id}"
+
+
+def get_payment_categories():
+    """Список категорий для формы из листа «Категории заявок».
+
+    Фолбэк на DDS_CATEGORIES, если лист пуст или недоступен.
+    """
+    try:
+        service = get_sheets_service()
+        rows = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range="Категории заявок!A2:A"
+        ).execute().get("values", [])
+        cats = [r[0].strip() for r in rows if r and r[0].strip()]
+        if cats:
+            return cats
+    except Exception as e:
+        print(f"get_payment_categories error: {e}")
+    return list(DDS_CATEGORIES)
+
+
+def add_payment_category(name):
+    name = (name or "").strip()
+    if not name:
+        return
+    try:
+        if name in get_payment_categories():
+            return
+        service = get_sheets_service()
+        service.spreadsheets().values().append(
+            spreadsheetId=SHEET_ID,
+            range="Категории заявок!A:A",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [[name]]},
+        ).execute()
+    except Exception as e:
+        print(f"add_payment_category error: {e}")
+
+
+def delete_payment_category(name):
+    """Удаляет категорию: перезаписывает столбец A оставшимися значениями."""
+    name = (name or "").strip()
+    if not name:
+        return
+    try:
+        remaining = [c for c in get_payment_categories() if c != name]
+        service = get_sheets_service()
+        # Чистим всё под заголовком и пишем заново
+        service.spreadsheets().values().clear(
+            spreadsheetId=SHEET_ID, range="Категории заявок!A2:A",
+        ).execute()
+        if remaining:
+            service.spreadsheets().values().update(
+                spreadsheetId=SHEET_ID,
+                range="Категории заявок!A2",
+                valueInputOption="RAW",
+                body={"values": [[c] for c in remaining]},
+            ).execute()
+    except Exception as e:
+        print(f"delete_payment_category error: {e}")
+
+
 def upload_invoice_to_disk(filename, content_bytes):
     """Загружает файл счёта на Bitrix-диск, возвращает ссылку для просмотра.
 
@@ -1582,7 +1679,7 @@ def append_payment_request_row(row):
         service = get_sheets_service()
         service.spreadsheets().values().append(
             spreadsheetId=SHEET_ID,
-            range="Заявки!A:J",
+            range="Заявки!A:K",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body={"values": [row]},
@@ -1591,22 +1688,16 @@ def append_payment_request_row(row):
         print(f"append_payment_request_row error: {e}")
 
 
-def _render_payment_form(requester, users, error=None):
+def _render_payment_form(users, categories, error=None):
     """HTML-форма создания заявки на оплату (открывается как Local App)."""
     cat_options = "\n".join(
-        f'<option value="{c}">{c}</option>' for c in DDS_CATEGORIES
+        f'<option value="{c}">{c}</option>' for c in categories
     )
     user_options = "\n".join(
         f'<option value="{u["id"]}">{u["name"]}</option>' for u in users
     )
     err_html = (
         f'<div class="err">⚠️ {error}</div>' if error else ""
-    )
-    requester_name = requester.get("name") or ""
-    requester_id = requester.get("id") or ""
-    requester_badge = (
-        f'<div class="who">Заявитель: <b>{requester_name}</b></div>'
-        if requester_name else ""
     )
     return Response(
         f"""<!DOCTYPE html>
@@ -1665,12 +1756,17 @@ def _render_payment_form(requester, users, error=None):
     </div>
   </div>
   <div class="body">
-    {requester_badge}
     {err_html}
     <form method="POST" action="/pay/submit" enctype="multipart/form-data"
           onsubmit="var b=this.querySelector('button');b.disabled=true;b.textContent='Отправляем…';">
-      <input type="hidden" name="requester_name" value="{requester_name}">
-      <input type="hidden" name="requester_id" value="{requester_id}">
+
+      <label>Заявитель <span class="req">*</span>
+        <span class="hint" id="reqAutoNote" style="display:none">— определён автоматически</span>
+      </label>
+      <select name="requester_id" id="requesterSelect" required>
+        <option value="" disabled selected>— выберите себя —</option>
+        {user_options}
+      </select>
 
       <div class="row">
         <div>
@@ -1686,8 +1782,11 @@ def _render_payment_form(requester, users, error=None):
       <label>Категория <span class="req">*</span></label>
       <select name="category" required>{cat_options}</select>
 
-      <label>Получатель / реквизиты <span class="req">*</span></label>
-      <textarea name="recipient" placeholder="Кому платим: название, счёт/карта, ИНН" required></textarea>
+      <label>Получатель <span class="req">*</span></label>
+      <input type="text" name="recipient" placeholder="Кому платим: название / ФИО / ИП" required>
+
+      <label>Реквизиты <span class="req">*</span></label>
+      <textarea name="requisites" placeholder="Счёт / карта / ИНН / БИК" required></textarea>
 
       <label>Назначение платежа <span class="req">*</span></label>
       <textarea name="purpose" placeholder="За что платёж" required></textarea>
@@ -1706,10 +1805,30 @@ def _render_payment_form(requester, users, error=None):
   </div>
 </div>
 <script>
-  // BX24 JS API: вписываем приложение в окно Битрикса
+  // BX24 JS API: авто-ресайз + автоопределение текущего пользователя (заявителя)
   try {{
     if (window.BX24) {{
-      BX24.init(function() {{ try {{ BX24.fitWindow(); }} catch(e) {{}} }});
+      BX24.init(function() {{
+        try {{ BX24.fitWindow(); }} catch(e) {{}}
+        try {{
+          BX24.callMethod('user.current', {{}}, function(res) {{
+            if (res.error()) return;
+            var u = res.data();
+            var sel = document.getElementById('requesterSelect');
+            if (u && u.ID && sel) {{
+              // если такого сотрудника нет в списке — добавим опцию
+              if (!sel.querySelector('option[value="' + u.ID + '"]')) {{
+                var o = document.createElement('option');
+                o.value = u.ID;
+                o.textContent = ((u.NAME||'') + ' ' + (u.LAST_NAME||'')).trim() || ('ID ' + u.ID);
+                sel.appendChild(o);
+              }}
+              sel.value = u.ID;
+              document.getElementById('reqAutoNote').style.display = 'inline';
+            }}
+          }});
+        }} catch(e) {{}}
+      }});
     }}
   }} catch(e) {{}}
 </script>
@@ -1739,18 +1858,15 @@ def _render_payment_result(ok, message):
 
 @app.route("/pay", methods=["GET", "POST"])
 def payment_form_route():
-    """Local Application: форма создания заявки на оплату."""
-    # Bitrix открывает Local App через POST с AUTH-параметрами.
-    data = parse_request_data()
-    auth = parse_auth_from_event(data)
-    access_token = auth.get("access_token") or data.get("AUTH_ID")
-    client_endpoint = (
-        auth.get("client_endpoint")
-        or derive_client_endpoint(auth.get("domain"))
-    )
-    requester = fetch_requester(access_token, client_endpoint)
+    """Local Application: форма создания заявки на оплату.
+
+    Заявитель определяется автоматически на клиенте через BX24
+    (user.current), поэтому серверу auth-токен не нужен — достаточно
+    отдать список сотрудников (фолбэк-выбор) и актуальные категории.
+    """
     users = fetch_active_users()
-    return _render_payment_form(requester, users)
+    categories = get_payment_categories()
+    return _render_payment_form(users, categories)
 
 
 @app.route("/pay/submit", methods=["POST"])
@@ -1758,28 +1874,21 @@ def payment_submit_route():
     """Приём заявки: загрузка счёта, запись в Sheets, уведомление в чат."""
     try:
         form = request.form
-        amount    = (form.get("amount") or "").strip()
-        category  = (form.get("category") or "").strip()
-        recipient = (form.get("recipient") or "").strip()
-        purpose   = (form.get("purpose") or "").strip()
-        due_date  = (form.get("due_date") or "").strip()
-        payer_id  = (form.get("payer_id") or "").strip()
-        requester_name = (form.get("requester_name") or "").strip() or "Сотрудник"
+        amount       = (form.get("amount") or "").strip()
+        category     = (form.get("category") or "").strip()
+        recipient    = (form.get("recipient") or "").strip()
+        requisites   = (form.get("requisites") or "").strip()
+        purpose      = (form.get("purpose") or "").strip()
+        due_date     = (form.get("due_date") or "").strip()
+        payer_id     = (form.get("payer_id") or "").strip()
+        requester_id = (form.get("requester_id") or "").strip()
 
-        if not (amount and category and recipient and purpose and payer_id):
+        if not (amount and category and recipient and requisites and purpose
+                and payer_id and requester_id):
             return _render_payment_result(False, "Заполнены не все обязательные поля")
 
-        # Имя плательщика (для текста сообщения и таблицы)
-        payer_name = ""
-        try:
-            r = bitrix_post("user.get", {"ID": payer_id}, timeout=10)
-            res = (r.json().get("result") or []) if r.status_code == 200 else []
-            if res:
-                payer_name = _combine_first_last(res[0].get("NAME"), res[0].get("LAST_NAME"))
-        except Exception as e:
-            print(f"payment_submit user.get error: {e}")
-        if not payer_name:
-            payer_name = f"ID {payer_id}"
+        payer_name     = resolve_user_name(payer_id)
+        requester_name = resolve_user_name(requester_id)
 
         # Файл счёта → Bitrix Drive
         file_link = ""
@@ -1791,7 +1900,7 @@ def payment_submit_route():
         # Запись в Google Sheets
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         append_payment_request_row([
-            now, requester_name, category, amount, recipient,
+            now, requester_name, category, amount, recipient, requisites,
             purpose, due_date or "—", payer_name, file_link or "—", "Новая",
         ])
 
@@ -1803,6 +1912,7 @@ def payment_submit_route():
                 f"💰 Сумма: {amount}",
                 f"📂 Категория: {category}",
                 f"🏦 Получатель: {recipient}",
+                f"💳 Реквизиты: {requisites}",
                 f"📝 Назначение: {purpose}",
                 f"📅 Срок оплаты: {due_date or '—'}",
             ]
@@ -1818,6 +1928,73 @@ def payment_submit_route():
     except Exception as e:
         print(f"payment_submit_route error: {e}")
         return _render_payment_result(False, "Не удалось создать заявку. Попробуйте ещё раз.")
+
+
+@app.route("/categories", methods=["GET"])
+def categories_route():
+    """Страница управления категориями заявок: список + добавить/удалить."""
+    cats = get_payment_categories()
+    rows = ""
+    for c in cats:
+        rows += f"""
+        <li>
+          <span>{c}</span>
+          <form method="POST" action="/categories/delete" onsubmit="return confirm('Удалить категорию «{c}»?');">
+            <input type="hidden" name="name" value="{c}">
+            <button class="del" title="Удалить">✕</button>
+          </form>
+        </li>"""
+    html = f"""<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Платежи · категории</title>
+<style>
+  body {{ font-family:'Helvetica Neue',Arial,system-ui,sans-serif; background:#eef2f4;
+         margin:0; padding:18px; color:#1e2734; }}
+  .card {{ max-width:560px; margin:0 auto; background:#fff; border:1px solid #dfe5ec;
+           border-radius:14px; overflow:hidden; box-shadow:0 2px 10px rgba(31,49,71,.06); }}
+  .head {{ padding:18px 24px; background:linear-gradient(135deg,#2066b0,#17518f); color:#fff; }}
+  .head h1 {{ margin:0; font-size:18px; }}
+  .body {{ padding:18px 24px 24px; }}
+  ul {{ list-style:none; margin:0 0 18px; padding:0; }}
+  li {{ display:flex; align-items:center; justify-content:space-between; gap:10px;
+        padding:10px 12px; border:1px solid #eef2f4; border-radius:9px; margin-bottom:8px; }}
+  li span {{ font-size:15px; }}
+  li form {{ margin:0; }}
+  .del {{ border:0; background:#fdecec; color:#c0392b; width:28px; height:28px;
+          border-radius:7px; cursor:pointer; font-size:14px; }}
+  .del:hover {{ background:#f8d4d4; }}
+  .add {{ display:flex; gap:10px; }}
+  .add input {{ flex:1; padding:11px 13px; font-size:15px; border:1px solid #dfe5ec; border-radius:9px; }}
+  .add button {{ padding:11px 18px; font-size:15px; font-weight:600; color:#fff;
+                 background:#2066b0; border:0; border-radius:9px; cursor:pointer; }}
+  .add button:hover {{ background:#17518f; }}
+</style></head>
+<body><div class="card">
+  <div class="head"><h1>📂 Категории заявок</h1></div>
+  <div class="body">
+    <ul>{rows or '<li><span>Список пуст</span></li>'}</ul>
+    <form class="add" method="POST" action="/categories/add">
+      <input type="text" name="name" placeholder="Новая категория" required>
+      <button>Добавить</button>
+    </form>
+  </div>
+</div></body></html>"""
+    return Response(html, mimetype="text/html; charset=utf-8")
+
+
+@app.route("/categories/add", methods=["POST"])
+def categories_add_route():
+    add_payment_category(request.form.get("name"))
+    return Response('<meta http-equiv="refresh" content="0;url=/categories">',
+                    mimetype="text/html; charset=utf-8")
+
+
+@app.route("/categories/delete", methods=["POST"])
+def categories_delete_route():
+    delete_payment_category(request.form.get("name"))
+    return Response('<meta http-equiv="refresh" content="0;url=/categories">',
+                    mimetype="text/html; charset=utf-8")
 
 
 # ─────────────────────────────────────────────
