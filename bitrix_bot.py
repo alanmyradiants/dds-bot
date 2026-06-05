@@ -1814,10 +1814,16 @@ def _render_payment_form(users, categories, error=None):
       <label>Заявитель <span class="req">*</span>
         <span class="hint" id="reqAutoNote" style="display:none">— определён автоматически</span>
       </label>
-      <select name="requester_id" id="requesterSelect" required>
-        <option value="" disabled selected>— выберите себя —</option>
+      <!-- Видимый select заблокирован: значение определяется автоматически (BX24).
+           Реально на сервер уходит скрытое поле requester_id. -->
+      <select id="requesterSelect" disabled style="background:#f4f6f8;cursor:not-allowed;">
+        <option value="" selected>— определяется автоматически —</option>
         {user_options}
       </select>
+      <input type="hidden" name="requester_id" id="requesterIdHidden">
+      <div class="hint" id="reqManualNote" style="display:none;margin-top:6px;">
+        Не удалось определить автоматически — выберите себя из списка.
+      </div>
 
       <div class="row">
         <div>
@@ -1856,32 +1862,50 @@ def _render_payment_form(users, categories, error=None):
   </div>
 </div>
 <script>
-  // BX24 JS API: авто-ресайз + автоопределение текущего пользователя (заявителя)
+  var sel    = document.getElementById('requesterSelect');
+  var hidden = document.getElementById('requesterIdHidden');
+
+  // Фолбэк: форма открыта вне Битрикса — разблокируем выбор заявителя вручную.
+  function enableManual() {{
+    sel.disabled = false;
+    sel.style.background = '#fff';
+    sel.style.cursor = 'pointer';
+    sel.setAttribute('required', 'required');
+    document.getElementById('reqManualNote').style.display = 'block';
+    sel.addEventListener('change', function() {{ hidden.value = sel.value; }});
+  }}
+
+  // Автоопределение через BX24 (когда форма открыта внутри Битрикса).
   try {{
     if (window.BX24) {{
+      var done = false;
       BX24.init(function() {{
         try {{ BX24.fitWindow(); }} catch(e) {{}}
         try {{
           BX24.callMethod('user.current', {{}}, function(res) {{
-            if (res.error()) return;
+            if (res.error()) {{ if (!done) enableManual(); return; }}
             var u = res.data();
-            var sel = document.getElementById('requesterSelect');
-            if (u && u.ID && sel) {{
-              // если такого сотрудника нет в списке — добавим опцию
+            if (u && u.ID) {{
               if (!sel.querySelector('option[value="' + u.ID + '"]')) {{
                 var o = document.createElement('option');
                 o.value = u.ID;
                 o.textContent = ((u.NAME||'') + ' ' + (u.LAST_NAME||'')).trim() || ('ID ' + u.ID);
                 sel.appendChild(o);
               }}
-              sel.value = u.ID;
+              sel.value = u.ID;          // показываем имя (поле остаётся заблокированным)
+              hidden.value = u.ID;        // именно это уходит на сервер
               document.getElementById('reqAutoNote').style.display = 'inline';
-            }}
+              done = true;
+            }} else if (!done) {{ enableManual(); }}
           }});
-        }} catch(e) {{}}
+        }} catch(e) {{ enableManual(); }}
       }});
+      // страховка: если BX24 не ответил за 4 сек — даём выбрать вручную
+      setTimeout(function() {{ if (!done && !hidden.value) enableManual(); }}, 4000);
+    }} else {{
+      enableManual();
     }}
-  }} catch(e) {{}}
+  }} catch(e) {{ enableManual(); }}
 </script>
 </body></html>""",
         mimetype="text/html; charset=utf-8",
