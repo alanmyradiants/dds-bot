@@ -2044,6 +2044,46 @@ def categories_reset_route():
                     mimetype="text/html; charset=utf-8")
 
 
+@app.route("/install-app", methods=["GET", "POST"])
+def install_app_route():
+    """Установка Local App «Платежи»: ТОЛЬКО привязка пункта меню (placement).
+
+    В отличие от /install не трогает чат-бота — нужен, чтобы добавить
+    приложение «Платежи» в левое меню Битрикса, не вмешиваясь в уже
+    работающий PDF-бот (вебхук-конструктор).
+    """
+    if request.method == "GET":
+        return _render_install_page()
+
+    data = parse_request_data()
+    auth = parse_auth_from_event(data)
+    access_token = auth.get("access_token") or str(data.get("AUTH_ID") or "")
+    client_endpoint = auth.get("client_endpoint") or derive_client_endpoint(auth.get("domain"))
+
+    if not access_token or not client_endpoint:
+        return _render_install_page(
+            error="Битрикс не прислал access_token/endpoint. Проверь, что приложение "
+                  "ставится как Локальное приложение (тип «Серверное», со scope placement)."
+        ), 400
+
+    ok = _bind_payment_placement(client_endpoint, access_token)
+    if ok:
+        return Response(
+            """<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">
+<script src="//api.bitrix24.com/api/v1/"></script></head>
+<body style="font-family:system-ui,sans-serif;max-width:560px;margin:40px auto;padding:24px;">
+<h2 style="color:#28a745;">✅ Приложение «Платежи» установлено</h2>
+<p>В левом меню Битрикса появился пункт <b>«Платежи»</b>. Открой его — заявитель будет
+определяться автоматически.</p>
+<script>try{if(window.BX24){BX24.init(function(){try{BX24.installFinish();}catch(e){}});}}catch(e){}</script>
+</body></html>""",
+            mimetype="text/html; charset=utf-8",
+        )
+    return _render_install_page(
+        error="Не удалось привязать пункт меню. Убедись, что у приложения есть scope «placement»."
+    ), 500
+
+
 # ─────────────────────────────────────────────
 # OAuth Local App — установка приложения
 # ─────────────────────────────────────────────
