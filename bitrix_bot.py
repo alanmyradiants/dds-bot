@@ -1561,70 +1561,115 @@ def _render_payment_form(requester, users, error=None):
     )
     requester_name = requester.get("name") or ""
     requester_id = requester.get("id") or ""
+    requester_badge = (
+        f'<div class="who">Заявитель: <b>{requester_name}</b></div>'
+        if requester_name else ""
+    )
     return Response(
         f"""<!DOCTYPE html>
 <html lang="ru"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Заявка на оплату</title>
+<title>Платежи · заявка на оплату</title>
+<script src="//api.bitrix24.com/api/v1/"></script>
 <style>
-  * {{ box-sizing: border-box; }}
-  body {{ font-family: system-ui, -apple-system, sans-serif; margin:0; padding:16px;
-         background:#f4f6f8; color:#222; }}
-  .card {{ max-width:560px; margin:0 auto; background:#fff; border-radius:12px;
-           padding:24px; box-shadow:0 1px 4px rgba(0,0,0,.08); }}
-  h1 {{ font-size:20px; margin:0 0 4px; }}
-  .sub {{ color:#888; font-size:13px; margin:0 0 20px; }}
-  label {{ display:block; font-size:13px; font-weight:600; margin:14px 0 5px; }}
-  input, select, textarea {{ width:100%; padding:10px 12px; font-size:15px;
-           border:1px solid #d0d5dd; border-radius:8px; background:#fff; }}
-  textarea {{ resize:vertical; min-height:64px; }}
-  button {{ width:100%; margin-top:22px; padding:13px; font-size:16px; font-weight:600;
-           color:#fff; background:#2563eb; border:0; border-radius:8px; cursor:pointer; }}
-  button:hover {{ background:#1d4ed8; }}
-  button:disabled {{ background:#9bb4e8; cursor:default; }}
-  .err {{ background:#fde8e8; color:#b42318; padding:10px 12px; border-radius:8px;
-          font-size:14px; margin-bottom:12px; }}
-  .req {{ color:#b42318; }}
+  :root {{
+    --bx-blue:#2066b0; --bx-blue-dark:#17518f; --bx-bg:#eef2f4;
+    --bx-border:#dfe5ec; --bx-text:#1e2734; --bx-muted:#7d8a99;
+  }}
+  * {{ box-sizing:border-box; }}
+  body {{ font-family:'Helvetica Neue',Arial,system-ui,sans-serif; margin:0;
+         padding:18px; background:var(--bx-bg); color:var(--bx-text); }}
+  .card {{ max-width:600px; margin:0 auto; background:#fff; border:1px solid var(--bx-border);
+           border-radius:14px; overflow:hidden; box-shadow:0 2px 10px rgba(31,49,71,.06); }}
+  .head {{ display:flex; align-items:center; gap:12px; padding:20px 24px;
+           background:linear-gradient(135deg,var(--bx-blue),var(--bx-blue-dark)); color:#fff; }}
+  .head .ic {{ font-size:26px; line-height:1; }}
+  .head h1 {{ font-size:19px; margin:0; font-weight:600; }}
+  .head .tag {{ font-size:12px; opacity:.85; margin-top:2px; }}
+  .body {{ padding:22px 24px 26px; }}
+  .who {{ font-size:13px; color:var(--bx-muted); margin-bottom:14px;
+          background:var(--bx-bg); padding:8px 12px; border-radius:8px; }}
+  label {{ display:block; font-size:13px; font-weight:600; margin:16px 0 6px; }}
+  .hint {{ font-weight:400; color:var(--bx-muted); }}
+  input, select, textarea {{ width:100%; padding:11px 13px; font-size:15px; color:var(--bx-text);
+           border:1px solid var(--bx-border); border-radius:9px; background:#fff;
+           transition:border-color .15s, box-shadow .15s; }}
+  input:focus, select:focus, textarea:focus {{ outline:none; border-color:var(--bx-blue);
+           box-shadow:0 0 0 3px rgba(32,102,176,.12); }}
+  textarea {{ resize:vertical; min-height:62px; }}
+  .row {{ display:flex; gap:14px; }}
+  .row > div {{ flex:1; }}
+  .file {{ border:1px dashed var(--bx-border); border-radius:9px; padding:11px 13px;
+           background:var(--bx-bg); }}
+  button {{ width:100%; margin-top:24px; padding:14px; font-size:16px; font-weight:600;
+           color:#fff; background:var(--bx-blue); border:0; border-radius:10px; cursor:pointer;
+           transition:background .15s; }}
+  button:hover {{ background:var(--bx-blue-dark); }}
+  button:disabled {{ background:#9cb6d4; cursor:default; }}
+  .err {{ background:#fdecec; color:#c0392b; padding:11px 13px; border-radius:9px;
+          font-size:14px; margin-bottom:14px; }}
+  .req {{ color:#c0392b; }}
 </style>
 </head>
 <body>
 <div class="card">
-  <h1>🧾 Заявка на оплату</h1>
-  <p class="sub">Заполните поля — ответственный за оплату получит уведомление в чат.</p>
-  {err_html}
-  <form method="POST" action="/pay/submit" enctype="multipart/form-data"
-        onsubmit="this.querySelector('button').disabled=true;this.querySelector('button').textContent='Отправляем…';">
-    <input type="hidden" name="requester_name" value="{requester_name}">
-    <input type="hidden" name="requester_id" value="{requester_id}">
+  <div class="head">
+    <div class="ic">💳</div>
+    <div>
+      <h1>Платежи</h1>
+      <div class="tag">Заявка на оплату</div>
+    </div>
+  </div>
+  <div class="body">
+    {requester_badge}
+    {err_html}
+    <form method="POST" action="/pay/submit" enctype="multipart/form-data"
+          onsubmit="var b=this.querySelector('button');b.disabled=true;b.textContent='Отправляем…';">
+      <input type="hidden" name="requester_name" value="{requester_name}">
+      <input type="hidden" name="requester_id" value="{requester_id}">
 
-    <label>Сумма <span class="req">*</span></label>
-    <input type="text" name="amount" inputmode="decimal" placeholder="например, 15000" required>
+      <div class="row">
+        <div>
+          <label>Сумма, ₽ <span class="req">*</span></label>
+          <input type="text" name="amount" inputmode="decimal" placeholder="15 000" required>
+        </div>
+        <div>
+          <label>Срок оплаты</label>
+          <input type="date" name="due_date">
+        </div>
+      </div>
 
-    <label>Категория <span class="req">*</span></label>
-    <select name="category" required>{cat_options}</select>
+      <label>Категория <span class="req">*</span></label>
+      <select name="category" required>{cat_options}</select>
 
-    <label>Получатель / реквизиты <span class="req">*</span></label>
-    <textarea name="recipient" placeholder="Кому платим: название, счёт/карта, ИНН" required></textarea>
+      <label>Получатель / реквизиты <span class="req">*</span></label>
+      <textarea name="recipient" placeholder="Кому платим: название, счёт/карта, ИНН" required></textarea>
 
-    <label>Назначение платежа <span class="req">*</span></label>
-    <textarea name="purpose" placeholder="За что платёж" required></textarea>
+      <label>Назначение платежа <span class="req">*</span></label>
+      <textarea name="purpose" placeholder="За что платёж" required></textarea>
 
-    <label>Срок оплаты</label>
-    <input type="date" name="due_date">
+      <label>Кто оплачивает <span class="req">*</span> <span class="hint">— получит уведомление в чат</span></label>
+      <select name="payer_id" required>
+        <option value="" disabled selected>— выберите сотрудника —</option>
+        {user_options}
+      </select>
 
-    <label>Кто оплачивает <span class="req">*</span></label>
-    <select name="payer_id" required>
-      <option value="" disabled selected>— выберите сотрудника —</option>
-      {user_options}
-    </select>
+      <label>Файл счёта <span class="hint">(PDF или фото)</span></label>
+      <div class="file"><input type="file" name="invoice" accept=".pdf,.jpg,.jpeg,.png" style="border:0;padding:0;background:transparent;"></div>
 
-    <label>Файл счёта</label>
-    <input type="file" name="invoice" accept=".pdf,.jpg,.jpeg,.png">
-
-    <button type="submit">Создать заявку</button>
-  </form>
+      <button type="submit">Создать заявку</button>
+    </form>
+  </div>
 </div>
+<script>
+  // BX24 JS API: вписываем приложение в окно Битрикса
+  try {{
+    if (window.BX24) {{
+      BX24.init(function() {{ try {{ BX24.fitWindow(); }} catch(e) {{}} }});
+    }}
+  }} catch(e) {{}}
+</script>
 </body></html>""",
         mimetype="text/html; charset=utf-8",
     )
@@ -1925,6 +1970,45 @@ def _register_chat_bot(client_endpoint, access_token):
     return final_bot_id
 
 
+def _bind_payment_placement(client_endpoint, access_token):
+    """Регистрирует приложение «Платежи» как пункт левого меню Битрикса.
+
+    placement.bind(LEFT_MENU) добавляет в левое меню портала иконку,
+    открывающую нашу форму заявки `/pay` в iframe. Перед привязкой
+    снимаем старую (best-effort) — нужно при переустановке, иначе
+    placement.bind вернёт ошибку «handler already binded».
+    """
+    base = client_endpoint.rstrip("/")
+    handler_url = f"{APP_PUBLIC_URL}/pay"
+    # Снимаем старую привязку (best-effort)
+    try:
+        requests.post(
+            f"{base}/placement.unbind.json",
+            data={"auth": access_token, "PLACEMENT": "LEFT_MENU", "HANDLER": handler_url},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"placement.unbind error (ignored): {e}")
+    # Привязываем «Платежи»
+    try:
+        resp = requests.post(
+            f"{base}/placement.bind.json",
+            data={
+                "auth":        access_token,
+                "PLACEMENT":   "LEFT_MENU",
+                "HANDLER":     handler_url,
+                "TITLE":       "Платежи",
+                "DESCRIPTION": "Создание заявок на оплату",
+            },
+            timeout=15,
+        )
+        print(f"placement.bind(LEFT_MENU) status={resp.status_code} body={safe_preview(resp.text, 300)}")
+        return resp.status_code == 200 and not resp.json().get("error")
+    except Exception as e:
+        print(f"_bind_payment_placement error: {e}")
+        return False
+
+
 @app.route("/install", methods=["GET", "POST"])
 def install_handler():
     """Обработчик первоначальной установки Local App.
@@ -1976,6 +2060,9 @@ def install_handler():
     try:
         bot_id = _register_chat_bot(client_endpoint, access_token)
         print(f"✅ Бот зарегистрирован, BOT_ID={bot_id}")
+        # Регистрируем пункт меню «Платежи» → форма заявки на оплату
+        placement_ok = _bind_payment_placement(client_endpoint, access_token)
+        print(f"placement «Платежи»: {'✅' if placement_ok else '⚠️ не привязан'}")
         return _render_install_page(bot_id=bot_id)
     except Exception as e:
         print(f"INSTALL ERROR: {e}")
