@@ -555,12 +555,12 @@ def init_sheets():
     # Заголовок Заявки — журнал заявок на оплату
     service.spreadsheets().values().update(
         spreadsheetId=SHEET_ID,
-        range="Заявки!A1:K1",
+        range="Заявки!A1:L1",
         valueInputOption="RAW",
         body={"values": [[
             "Дата создания", "Заявитель", "Категория", "Сумма",
             "Получатель", "Реквизиты", "Назначение платежа",
-            "Срок оплаты", "Плательщик", "Файл счёта", "Статус",
+            "Срок оплаты", "Срочность", "Плательщик", "Файл счёта", "Статус",
         ]]},
     ).execute()
 
@@ -1752,7 +1752,7 @@ def append_payment_request_row(row):
         service = get_sheets_service()
         service.spreadsheets().values().append(
             spreadsheetId=SHEET_ID,
-            range="Заявки!A:K",
+            range="Заявки!A:L",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body={"values": [row]},
@@ -1854,6 +1854,13 @@ def _render_payment_form(users, categories, error=None):
   .err {{ background:#fdecec; color:#c0392b; padding:11px 13px; border-radius:9px;
           font-size:14px; margin-bottom:14px; }}
   .req {{ color:#c0392b; }}
+  /* Срочный платёж — «горит» красным */
+  select.urgent {{ border-color:#e0392b; color:#c0392b; background:#fdecec;
+           font-weight:700; box-shadow:0 0 0 3px rgba(224,57,43,.12); }}
+  select.urgent:focus {{ border-color:#e0392b; box-shadow:0 0 0 3px rgba(224,57,43,.2); }}
+  @keyframes urgPulse {{ 0%,100%{{box-shadow:0 0 0 3px rgba(224,57,43,.12);}}
+           50%{{box-shadow:0 0 0 5px rgba(224,57,43,.28);}} }}
+  select.urgent {{ animation:urgPulse 1.2s ease-in-out infinite; }}
 </style>
 </head>
 <body>
@@ -1895,6 +1902,12 @@ def _render_payment_form(users, categories, error=None):
         </div>
       </div>
 
+      <label>Срочность платежа <span class="req">*</span></label>
+      <select name="urgency" id="urgencySelect" required onchange="syncUrgency()">
+        <option value="Не срочный" selected>🟢 Не срочный</option>
+        <option value="Срочный">🔴 СРОЧНЫЙ — оплатить как можно скорее</option>
+      </select>
+
       <label>Категория <span class="req">*</span></label>
       <select name="category" required>{cat_options}</select>
 
@@ -1918,6 +1931,14 @@ def _render_payment_form(users, categories, error=None):
   </div>
 </div>
 <script>
+  // Срочность: красная подсветка «горит», когда выбран срочный платёж.
+  function syncUrgency() {{
+    var u = document.getElementById('urgencySelect');
+    if (u.value === 'Срочный') {{ u.classList.add('urgent'); }}
+    else {{ u.classList.remove('urgent'); }}
+  }}
+  syncUrgency();
+
   var sel    = document.getElementById('requesterSelect');
   var hidden = document.getElementById('requesterIdHidden');
 
@@ -2011,8 +2032,10 @@ def payment_submit_route():
         requisites   = (form.get("requisites") or "").strip()
         purpose      = (form.get("purpose") or "").strip()
         due_date     = (form.get("due_date") or "").strip()
+        urgency      = (form.get("urgency") or "Не срочный").strip()
         payer_id     = (form.get("payer_id") or "").strip()
         requester_id = (form.get("requester_id") or "").strip()
+        is_urgent    = urgency == "Срочный"
 
         if not (amount and category and recipient and requisites and purpose
                 and payer_id and requester_id):
@@ -2032,18 +2055,21 @@ def payment_submit_route():
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         append_payment_request_row([
             now, requester_name, category, amount, recipient, requisites,
-            purpose, due_date or "—", payer_name, file_link or "—", "Новая",
+            purpose, due_date or "—", urgency, payer_name, file_link or "—", "Новая",
         ])
 
         # Уведомление в чат с упоминанием плательщика.
         # Для отдельных плательщиков (напр. Анастасия) — их собственный чат.
         notify_chat_id = resolve_payment_chat(payer_name)
         if notify_chat_id:
+            header = ("🔴 [B]СРОЧНАЯ заявка на оплату[/B] 🔴" if is_urgent
+                      else "🧾 [B]Новая заявка на оплату[/B]")
             lines = [
-                "🧾 [B]Новая заявка на оплату[/B]",
+                header,
                 f"👤 Заявитель: {requester_name}",
                 f"💰 Сумма: {amount}",
                 f"📂 Категория: {category}",
+                f"🚦 Срочность: {'🔴 СРОЧНЫЙ' if is_urgent else '🟢 Не срочный'}",
                 f"🏦 Получатель: {recipient}",
                 f"💳 Реквизиты: {requisites}",
                 f"📝 Назначение: {purpose}",
