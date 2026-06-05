@@ -1899,8 +1899,10 @@ def _render_payment_form(users, categories, error=None):
       <label>Реквизиты</label>
       <textarea name="requisites" placeholder="Счёт / карта / ИНН / БИК"></textarea>
 
-      <label>Назначение платежа <span class="req">*</span></label>
-      <textarea name="purpose" placeholder="За что платёж" required></textarea>
+      <label>Назначение платежа <span class="req">*</span>
+        <span class="hint">— (номер счёта, назначение, дата)</span>
+      </label>
+      <textarea name="purpose" placeholder="Напр.: счёт №125, закуп ткани, 05.06.2026" required></textarea>
 
       <label>Кто оплачивает <span class="req">*</span> <span class="hint">— получит уведомление в чат</span></label>
       {payer_field}
