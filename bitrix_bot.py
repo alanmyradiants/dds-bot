@@ -2046,11 +2046,13 @@ def categories_reset_route():
 
 @app.route("/install-app", methods=["GET", "POST"])
 def install_app_route():
-    """Установка Local App «Платежи»: ТОЛЬКО привязка пункта меню (placement).
+    """Установка Local App «Платежи».
 
-    В отличие от /install не трогает чат-бота — нужен, чтобы добавить
-    приложение «Платежи» в левое меню Битрикса, не вмешиваясь в уже
-    работающий PDF-бот (вебхук-конструктор).
+    Само Локальное приложение уже добавляет пункт меню «Платежи» (через поле
+    «Название пункта меню»), поэтому отдельный placement.bind НЕ нужен — иначе
+    появляется дубль. Здесь только подчищаем возможную лишнюю привязку
+    LEFT_MENU (если она осталась от прошлых версий) и завершаем установку.
+    Чат-бот не трогаем — он живёт отдельно (вебхук-конструктор).
     """
     if request.method == "GET":
         return _render_install_page()
@@ -2060,28 +2062,28 @@ def install_app_route():
     access_token = auth.get("access_token") or str(data.get("AUTH_ID") or "")
     client_endpoint = auth.get("client_endpoint") or derive_client_endpoint(auth.get("domain"))
 
-    if not access_token or not client_endpoint:
-        return _render_install_page(
-            error="Битрикс не прислал access_token/endpoint. Проверь, что приложение "
-                  "ставится как Локальное приложение (тип «Серверное», со scope placement)."
-        ), 400
+    # Снимаем нашу старую LEFT_MENU-привязку (best-effort) — убирает дубль
+    if access_token and client_endpoint:
+        try:
+            requests.post(
+                f"{client_endpoint.rstrip('/')}/placement.unbind.json",
+                data={"auth": access_token, "PLACEMENT": "LEFT_MENU",
+                      "HANDLER": f"{APP_PUBLIC_URL}/pay"},
+                timeout=10,
+            )
+        except Exception as e:
+            print(f"install-app unbind error (ignored): {e}")
 
-    ok = _bind_payment_placement(client_endpoint, access_token)
-    if ok:
-        return Response(
-            """<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">
+    return Response(
+        """<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">
 <script src="//api.bitrix24.com/api/v1/"></script></head>
 <body style="font-family:system-ui,sans-serif;max-width:560px;margin:40px auto;padding:24px;">
 <h2 style="color:#28a745;">✅ Приложение «Платежи» установлено</h2>
-<p>В левом меню Битрикса появился пункт <b>«Платежи»</b>. Открой его — заявитель будет
-определяться автоматически.</p>
+<p>Открой пункт <b>«Платежи»</b> в левом меню — заявитель определится автоматически.</p>
 <script>try{if(window.BX24){BX24.init(function(){try{BX24.installFinish();}catch(e){}});}}catch(e){}</script>
 </body></html>""",
-            mimetype="text/html; charset=utf-8",
-        )
-    return _render_install_page(
-        error="Не удалось привязать пункт меню. Убедись, что у приложения есть scope «placement»."
-    ), 500
+        mimetype="text/html; charset=utf-8",
+    )
 
 
 # ─────────────────────────────────────────────
@@ -2367,9 +2369,9 @@ def install_handler():
     try:
         bot_id = _register_chat_bot(client_endpoint, access_token)
         print(f"✅ Бот зарегистрирован, BOT_ID={bot_id}")
-        # Регистрируем пункт меню «Платежи» → форма заявки на оплату
-        placement_ok = _bind_payment_placement(client_endpoint, access_token)
-        print(f"placement «Платежи»: {'✅' if placement_ok else '⚠️ не привязан'}")
+        # Пункт меню «Платежи» создаёт само Локальное приложение «Платежи»
+        # (через поле «Название пункта меню»), поэтому здесь placement.bind
+        # НЕ вызываем — иначе появляется дубль пункта меню.
         return _render_install_page(bot_id=bot_id)
     except Exception as e:
         print(f"INSTALL ERROR: {e}")
