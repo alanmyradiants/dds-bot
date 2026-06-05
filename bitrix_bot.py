@@ -31,18 +31,25 @@ APP_PUBLIC_URL           = os.getenv("APP_PUBLIC_URL", "https://dds-bot-producti
 DISK_TOKEN = BITRIX_DISK_WEBHOOK_URL.rstrip("/").split("/")[-1]
 SHEET_URL  = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 
-# DIALOG_ID общего чата, куда бот шлёт уведомления о новых заявках на оплату.
-# Формат: "chat123" (для группового чата) или числовой ID пользователя.
-# Узнать ID чата можно через im.recent.get / im.chat.get или из URL чата.
-PAYMENT_CHAT_ID = os.getenv("PAYMENT_CHAT_ID", "").strip()
+# DIALOG_ID чата «Платежи» — ВСЕ заявки на оплату падают сюда, независимо от
+# плательщика (и Чермен, и Анастасия). Конкретный плательщик тегается внутри
+# чата через [USER=id]. Формат: "chatNNN" или числовой ID пользователя.
+# Узнать ID чата можно через /chats (im.recent.get) или из URL чата.
+PAYMENT_CHAT_ID = os.getenv("PAYMENT_CHAT_ID", "chat242").strip()
 
 # BOT_ID чат-бота (из конструктора чат-бота). Нужен для imbot.message.add
 # при вызове через входящий вебхук — иначе Битрикс не знает, от кого слать.
 BITRIX_BOT_ID = os.getenv("BITRIX_BOT_ID", "").strip()
 
-# Сотрудник-плательщик по умолчанию (подставляется в «Кто оплачивает»).
-# Сопоставляется по подстроке в ФИО — менять можно через env, не зная ID.
-PAYMENT_DEFAULT_PAYER_NAME = os.getenv("PAYMENT_DEFAULT_PAYER_NAME", "Кисиев").strip()
+# Сотрудники-плательщики для поля «Кто оплачивает».
+# Каждое имя сопоставляется по подстроке в ФИО (ID знать не нужно). Несколько
+# имён через запятую → переопределяется env PAYMENT_DEFAULT_PAYER_NAME.
+# Если совпал ровно один — поле блокируется; если несколько — выпадающий список.
+PAYMENT_PAYER_NAMES = [
+    n.strip()
+    for n in os.getenv("PAYMENT_DEFAULT_PAYER_NAME", "Кисиев, Фаткуллина").split(",")
+    if n.strip()
+]
 
 # ─────────────────────────────────────────────
 # Google Sheets credentials
@@ -97,6 +104,11 @@ PAYMENT_CATEGORIES_DEFAULT = [
     "Реклама у блогера",
     "Самовыкуп",
     "UGC-Блогеры",
+    "Закуп ткани",
+    "Закуп фурнитуры",
+    "Оплата ОТК",
+    "Оплата образцы",
+    "Создание креатором контента для Joto",
 ]
 
 # Встроенные правила (дополняются из вкладки "Правила")
@@ -524,18 +536,20 @@ def init_sheets():
     # Заголовок Заявки — журнал заявок на оплату
     service.spreadsheets().values().update(
         spreadsheetId=SHEET_ID,
-        range="Заявки!A1:K1",
+        range="Заявки!A1:L1",
         valueInputOption="RAW",
         body={"values": [[
             "Дата создания", "Заявитель", "Категория", "Сумма",
             "Получатель", "Реквизиты", "Назначение платежа",
-            "Срок оплаты", "Плательщик", "Файл счёта", "Статус",
+            "Срок оплаты", "Срочность", "Плательщик", "Файл счёта", "Статус",
         ]]},
     ).execute()
 
     # Лист «Категории заявок» — источник списка категорий для формы.
-    # Заголовок ставим всегда, а сами категории засеиваем DDS_CATEGORIES
-    # только если лист ещё пустой (чтобы не затереть правки пользователя).
+    # Заголовок ставим всегда. Стандартные категории из PAYMENT_CATEGORIES_DEFAULT
+    # дописываем недеструктивно: добавляем только те, которых ещё нет в листе, —
+    # так новые категории появляются после /init-sheets, а правки пользователя
+    # (свои категории) не затираются.
     service.spreadsheets().values().update(
         spreadsheetId=SHEET_ID,
         range="Категории заявок!A1",
@@ -545,14 +559,17 @@ def init_sheets():
     existing = service.spreadsheets().values().get(
         spreadsheetId=SHEET_ID, range="Категории заявок!A2:A"
     ).execute().get("values", [])
-    if not existing:
-        service.spreadsheets().values().update(
+    existing_cats = [r[0].strip() for r in existing if r and r[0].strip()]
+    missing = [c for c in PAYMENT_CATEGORIES_DEFAULT if c not in existing_cats]
+    if missing:
+        service.spreadsheets().values().append(
             spreadsheetId=SHEET_ID,
-            range="Категории заявок!A2",
+            range="Категории заявок!A:A",
             valueInputOption="RAW",
-            body={"values": [[c] for c in PAYMENT_CATEGORIES_DEFAULT]},
+            insertDataOption="INSERT_ROWS",
+            body={"values": [[c] for c in missing]},
         ).execute()
-        print("ℹ️ Категории засеяны из PAYMENT_CATEGORIES_DEFAULT")
+        print(f"ℹ️ Дописаны недостающие категории: {', '.join(missing)}")
 
     print("✅ Таблица инициализирована")
     print("ℹ️ Правила заполнятся автоматически при загрузке PDF")
@@ -1716,7 +1733,7 @@ def append_payment_request_row(row):
         service = get_sheets_service()
         service.spreadsheets().values().append(
             spreadsheetId=SHEET_ID,
-            range="Заявки!A:K",
+            range="Заявки!A:L",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body={"values": [row]},
@@ -1733,21 +1750,35 @@ def _render_payment_form(users, categories, error=None):
     user_options = "\n".join(
         f'<option value="{u["id"]}">{u["name"]}</option>' for u in users
     )
-    # Плательщик фиксирован (ответственный по умолчанию). Ищем его в списке.
-    default_match = PAYMENT_DEFAULT_PAYER_NAME.lower()
-    payer_default = next(
-        (u for u in users if default_match and default_match in u["name"].lower()),
-        None,
-    )
-    if payer_default:
-        # Заблокированное поле + скрытый payer_id — менять нельзя.
+    # Плательщики — только из разрешённого списка имён (по подстроке в ФИО).
+    allowed_payers = []
+    seen_payer_ids = set()
+    for name_part in PAYMENT_PAYER_NAMES:
+        np = name_part.lower()
+        for u in users:
+            if np in u["name"].lower() and u["id"] not in seen_payer_ids:
+                allowed_payers.append(u)
+                seen_payer_ids.add(u["id"])
+    if len(allowed_payers) == 1:
+        # Один плательщик — заблокированное поле + скрытый payer_id.
+        p = allowed_payers[0]
         payer_field = (
-            f'<input type="text" value="{payer_default["name"]}" readonly '
+            f'<input type="text" value="{p["name"]}" readonly '
             f'style="background:#f4f6f8;cursor:not-allowed;">'
-            f'<input type="hidden" name="payer_id" value="{payer_default["id"]}">'
+            f'<input type="hidden" name="payer_id" value="{p["id"]}">'
+        )
+    elif len(allowed_payers) >= 2:
+        # Несколько разрешённых плательщиков — выбор из них.
+        opts = "\n".join(
+            f'<option value="{u["id"]}">{u["name"]}</option>' for u in allowed_payers
+        )
+        payer_field = (
+            '<select name="payer_id" required>'
+            '<option value="" disabled selected>— выберите плательщика —</option>'
+            f'{opts}</select>'
         )
     else:
-        # Ответственный не найден в списке — даём выбрать вручную (фолбэк).
+        # Никто из списка не найден — фолбэк на полный список сотрудников.
         opts = "\n".join(
             f'<option value="{u["id"]}">{u["name"]}</option>' for u in users
         )
@@ -1804,6 +1835,13 @@ def _render_payment_form(users, categories, error=None):
   .err {{ background:#fdecec; color:#c0392b; padding:11px 13px; border-radius:9px;
           font-size:14px; margin-bottom:14px; }}
   .req {{ color:#c0392b; }}
+  /* Срочный платёж — «горит» красным */
+  select.urgent {{ border-color:#e0392b; color:#c0392b; background:#fdecec;
+           font-weight:700; box-shadow:0 0 0 3px rgba(224,57,43,.12); }}
+  select.urgent:focus {{ border-color:#e0392b; box-shadow:0 0 0 3px rgba(224,57,43,.2); }}
+  @keyframes urgPulse {{ 0%,100%{{box-shadow:0 0 0 3px rgba(224,57,43,.12);}}
+           50%{{box-shadow:0 0 0 5px rgba(224,57,43,.28);}} }}
+  select.urgent {{ animation:urgPulse 1.2s ease-in-out infinite; }}
 </style>
 </head>
 <body>
@@ -1845,6 +1883,12 @@ def _render_payment_form(users, categories, error=None):
         </div>
       </div>
 
+      <label>Срочность платежа <span class="req">*</span></label>
+      <select name="urgency" id="urgencySelect" required onchange="syncUrgency()">
+        <option value="Не срочный" selected>🟢 Не срочный</option>
+        <option value="Срочный">🔴 СРОЧНЫЙ — оплатить как можно скорее</option>
+      </select>
+
       <label>Категория <span class="req">*</span></label>
       <select name="category" required>{cat_options}</select>
 
@@ -1868,6 +1912,14 @@ def _render_payment_form(users, categories, error=None):
   </div>
 </div>
 <script>
+  // Срочность: красная подсветка «горит», когда выбран срочный платёж.
+  function syncUrgency() {{
+    var u = document.getElementById('urgencySelect');
+    if (u.value === 'Срочный') {{ u.classList.add('urgent'); }}
+    else {{ u.classList.remove('urgent'); }}
+  }}
+  syncUrgency();
+
   var sel    = document.getElementById('requesterSelect');
   var hidden = document.getElementById('requesterIdHidden');
 
@@ -1961,8 +2013,10 @@ def payment_submit_route():
         requisites   = (form.get("requisites") or "").strip()
         purpose      = (form.get("purpose") or "").strip()
         due_date     = (form.get("due_date") or "").strip()
+        urgency      = (form.get("urgency") or "Не срочный").strip()
         payer_id     = (form.get("payer_id") or "").strip()
         requester_id = (form.get("requester_id") or "").strip()
+        is_urgent    = urgency == "Срочный"
 
         if not (amount and category and recipient and requisites and purpose
                 and payer_id and requester_id):
@@ -1982,16 +2036,20 @@ def payment_submit_route():
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         append_payment_request_row([
             now, requester_name, category, amount, recipient, requisites,
-            purpose, due_date or "—", payer_name, file_link or "—", "Новая",
+            purpose, due_date or "—", urgency, payer_name, file_link or "—", "Новая",
         ])
 
-        # Уведомление в общий чат с упоминанием плательщика
+        # Уведомление в чат «Платежи» с упоминанием плательщика.
+        # Все заявки (и Чермен, и Анастасия) идут в один общий PAYMENT_CHAT_ID.
         if PAYMENT_CHAT_ID:
+            header = ("🔴 [B]СРОЧНАЯ заявка на оплату[/B] 🔴" if is_urgent
+                      else "🧾 [B]Новая заявка на оплату[/B]")
             lines = [
-                "🧾 [B]Новая заявка на оплату[/B]",
+                header,
                 f"👤 Заявитель: {requester_name}",
                 f"💰 Сумма: {amount}",
                 f"📂 Категория: {category}",
+                f"🚦 Срочность: {'🔴 СРОЧНЫЙ' if is_urgent else '🟢 Не срочный'}",
                 f"🏦 Получатель: {recipient}",
                 f"💳 Реквизиты: {requisites}",
                 f"📝 Назначение: {purpose}",
