@@ -53,6 +53,30 @@ PAYMENT_PAYER_NAMES = [
 ]
 
 # ─────────────────────────────────────────────
+# Заказы на производство (форма /order)
+# ─────────────────────────────────────────────
+# Чат, куда падают заказы на согласование. По умолчанию — тот же, что и
+# «Платежи»; можно развести отдельным env PRODUCTION_CHAT_ID.
+PRODUCTION_CHAT_ID = os.getenv("PRODUCTION_CHAT_ID", PAYMENT_CHAT_ID).strip()
+
+# Кто согласовывает заказы (по умолчанию — Алан). Сопоставляется по подстроке
+# в ФИО, как плательщики. Можно перечислить несколько через запятую.
+PRODUCTION_APPROVER_NAMES = [
+    n.strip()
+    for n in os.getenv("PRODUCTION_APPROVER_NAME", "Алан").split(",")
+    if n.strip()
+]
+
+# Интеграция с CRM: после согласования создаём элемент смарт-процесса и ставим
+# стадию. Всё best-effort — если PRODUCTION_SPA_ENTITY_TYPE_ID не задан, CRM-шаг
+# просто пропускается, а заказ всё равно фиксируется в Google Sheets и чате.
+# Вебхуку нужен scope `crm`; по умолчанию берём общий BITRIX_WEBHOOK_URL.
+BITRIX_CRM_WEBHOOK_URL        = os.getenv("BITRIX_CRM_WEBHOOK_URL", BITRIX_WEBHOOK_URL).rstrip("/")
+PRODUCTION_SPA_ENTITY_TYPE_ID = os.getenv("PRODUCTION_SPA_ENTITY_TYPE_ID", "").strip()
+PRODUCTION_SPA_CATEGORY_ID    = os.getenv("PRODUCTION_SPA_CATEGORY_ID", "").strip()
+PRODUCTION_SPA_STAGE_ID       = os.getenv("PRODUCTION_SPA_STAGE_ID", "").strip()
+
+# ─────────────────────────────────────────────
 # Google Sheets credentials
 # ─────────────────────────────────────────────
 GOOGLE_CREDS_JSON = json.loads(os.environ.get('GOOGLE_CREDENTIALS'))
@@ -502,7 +526,7 @@ def init_sheets():
     requests_body = []
 
     # Создаём листы если не существуют
-    for sheet_name in ["Транзакции", "Правила", "Заявки", "Категории заявок"]:
+    for sheet_name in ["Транзакции", "Правила", "Заявки", "Категории заявок", "Заказы"]:
         if sheet_name not in existing_sheets:
             requests_body.append({
                 "addSheet": {"properties": {"title": sheet_name}}
@@ -546,6 +570,22 @@ def init_sheets():
             "Срок оплаты", "Срочность", "Плательщик", "Файл счёта", "Статус",
             # Технические поля для отмены заявки из чата (можно скрыть колонки).
             "ID заявки", "ID заявителя", "ID сообщения",
+        ]]},
+    ).execute()
+
+    # Заголовок Заказы — журнал заказов на производство.
+    service.spreadsheets().values().update(
+        spreadsheetId=SHEET_ID,
+        range="Заказы!A1:U1",
+        valueInputOption="RAW",
+        body={"values": [[
+            "Дата создания", "Заявитель", "Дата заказа", "Артикул / модель",
+            "Размерный ряд и количество", "Цвет", "Ткань (состав)", "Фурнитура",
+            "Общий тираж", "Подрядчик / цех", "Срок (дедлайн)", "Срочность",
+            "Образец нужен", "Файлы", "Комментарий", "Статус",
+            # Технические поля для согласования из чата (можно скрыть колонки).
+            "ID заказа", "ID заявителя", "ID согласующего", "ID сообщения",
+            "CRM",
         ]]},
     ).execute()
 
@@ -2370,6 +2410,690 @@ def payment_cancel_confirm_route():
         return jsonify({"ok": False, "message": "Внутренняя ошибка"})
 
 
+# ─────────────────────────────────────────────
+# Заказы на производство (/order) — форма, согласование, CRM
+# ─────────────────────────────────────────────
+
+def bitrix_crm_post(method_name, payload, timeout=20):
+    """POST на CRM-вебхук Битрикса (scope `crm`)."""
+    url = f"{BITRIX_CRM_WEBHOOK_URL}/{method_name}.json"
+    return requests.post(url, json=payload, timeout=timeout)
+
+
+def resolve_approver(users=None):
+    """Согласующий (Алан) среди активных сотрудников — по подстроке в ФИО.
+
+    Возвращает {"id": int|None, "name": str}. Если не нашли — id=None,
+    name = первое из PRODUCTION_APPROVER_NAMES (для отображения).
+    """
+    if users is None:
+        users = fetch_active_users()
+    for name_part in PRODUCTION_APPROVER_NAMES:
+        np = name_part.lower()
+        for u in users:
+            if np in u["name"].lower():
+                return {"id": u["id"], "name": u["name"]}
+    return {"id": None,
+            "name": PRODUCTION_APPROVER_NAMES[0] if PRODUCTION_APPROVER_NAMES else "Согласующий"}
+
+
+def append_order_row(row):
+    """Добавляет строку заказа на производство в лист «Заказы»."""
+    try:
+        service = get_sheets_service()
+        service.spreadsheets().values().append(
+            spreadsheetId=SHEET_ID,
+            range="Заказы!A:U",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row]},
+        ).execute()
+    except Exception as e:
+        print(f"append_order_row error: {e}")
+
+
+# Колонки листа «Заказы» (0-based): P=Статус(15), Q=ID заказа(16),
+# R=ID заявителя(17), S=ID согласующего(18), T=ID сообщения(19), U=CRM(20).
+def find_order_row_by_rid(rid):
+    """Ищет заказ по ID (колонка Q). Возвращает (row_number, values) или (None, None)."""
+    rid = (rid or "").strip()
+    if not rid:
+        return None, None
+    try:
+        service = get_sheets_service()
+        rows = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range="Заказы!A2:U"
+        ).execute().get("values", [])
+        for i, r in enumerate(rows):
+            if len(r) > 16 and (r[16] or "").strip() == rid:
+                return i + 2, r  # +2: строки с 1, данные — со 2-й
+    except Exception as e:
+        print(f"find_order_row_by_rid error: {e}")
+    return None, None
+
+
+def set_order_status(row_number, status):
+    """Проставляет статус (колонка P) для заказа в указанной строке."""
+    try:
+        service = get_sheets_service()
+        service.spreadsheets().values().update(
+            spreadsheetId=SHEET_ID,
+            range=f"Заказы!P{row_number}",
+            valueInputOption="RAW",
+            body={"values": [[status]]},
+        ).execute()
+    except Exception as e:
+        print(f"set_order_status error: {e}")
+
+
+def set_order_crm_link(row_number, link):
+    """Записывает ссылку/ID элемента CRM (колонка U)."""
+    try:
+        service = get_sheets_service()
+        service.spreadsheets().values().update(
+            spreadsheetId=SHEET_ID,
+            range=f"Заказы!U{row_number}",
+            valueInputOption="RAW",
+            body={"values": [[link]]},
+        ).execute()
+    except Exception as e:
+        print(f"set_order_crm_link error: {e}")
+
+
+def create_crm_order_item(order):
+    """Создаёт элемент смарт-процесса CRM по согласованному заказу.
+
+    Best-effort: если PRODUCTION_SPA_ENTITY_TYPE_ID не задан или CRM-вебхук без
+    scope `crm` — тихо возвращает "" (заказ всё равно зафиксирован в Sheets/чате).
+    Возвращает ссылку на карточку (или ID элемента) для уведомления, либо "".
+
+    order — dict с полями заказа (см. вызов в /order/approve/confirm).
+    """
+    if not PRODUCTION_SPA_ENTITY_TYPE_ID:
+        print("create_crm_order_item: PRODUCTION_SPA_ENTITY_TYPE_ID не задан — CRM-шаг пропущен")
+        return ""
+    try:
+        title = f"Заказ: {order.get('model') or '—'}"
+        if order.get("quantity"):
+            title += f" · {order['quantity']} шт"
+        fields = {"title": title}
+        if PRODUCTION_SPA_CATEGORY_ID:
+            fields["categoryId"] = PRODUCTION_SPA_CATEGORY_ID
+        if PRODUCTION_SPA_STAGE_ID:
+            fields["stageId"] = PRODUCTION_SPA_STAGE_ID
+
+        resp = bitrix_crm_post(
+            "crm.item.add",
+            {"entityTypeId": PRODUCTION_SPA_ENTITY_TYPE_ID, "fields": fields},
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            print(f"crm.item.add status={resp.status_code} body={safe_preview(resp.text,300)}")
+            return ""
+        data = resp.json()
+        if data.get("error"):
+            print(f"crm.item.add error: {safe_preview(data,300)}")
+            return ""
+        item = (data.get("result") or {}).get("item") or {}
+        item_id = item.get("id")
+        if not item_id:
+            return ""
+
+        # Полные детали заказа — комментарием в таймлайн карточки (надёжно,
+        # не зависит от набора пользовательских полей смарт-процесса).
+        details = "\n".join([
+            "Заказ на производство (согласован):",
+            f"Заявитель: {order.get('requester') or '—'}",
+            f"Дата заказа: {order.get('order_date') or '—'}",
+            f"Артикул / модель: {order.get('model') or '—'}",
+            f"Размерный ряд и количество: {order.get('sizes') or '—'}",
+            f"Цвет: {order.get('color') or '—'}",
+            f"Ткань (состав): {order.get('fabric') or '—'}",
+            f"Фурнитура: {order.get('accessories') or '—'}",
+            f"Общий тираж: {order.get('quantity') or '—'}",
+            f"Подрядчик / цех: {order.get('contractor') or '—'}",
+            f"Срок (дедлайн): {order.get('deadline') or '—'}",
+            f"Срочность: {order.get('urgency') or '—'}",
+            f"Образец нужен: {order.get('sample') or '—'}",
+            f"Файлы: {order.get('files') or '—'}",
+            f"Комментарий: {order.get('comment') or '—'}",
+        ])
+        try:
+            bitrix_crm_post(
+                "crm.timeline.comment.add",
+                {"fields": {
+                    "ENTITY_ID": item_id,
+                    "ENTITY_TYPE": f"DYNAMIC_{PRODUCTION_SPA_ENTITY_TYPE_ID}",
+                    "COMMENT": details,
+                }},
+                timeout=20,
+            )
+        except Exception as e:
+            print(f"crm.timeline.comment.add error (ignored): {e}")
+
+        # Ссылка на карточку смарт-процесса.
+        portal = BITRIX_WEBHOOK_URL.split("/rest/")[0]
+        link = (f"{portal}/crm/type/{PRODUCTION_SPA_ENTITY_TYPE_ID}"
+                f"/details/{item_id}/")
+        return link
+    except Exception as e:
+        print(f"create_crm_order_item error: {e}")
+        return ""
+
+
+def _render_order_result(ok, message):
+    color = "#16a34a" if ok else "#b42318"
+    icon = "✅" if ok else "❌"
+    return Response(
+        f"""<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Заказ на производство</title></head>
+<body style="font-family:system-ui,sans-serif;background:#f4f6f8;margin:0;padding:24px;">
+<div style="max-width:480px;margin:40px auto;background:#fff;border-radius:12px;padding:32px;text-align:center;box-shadow:0 1px 4px rgba(0,0,0,.08);">
+  <div style="font-size:48px;">{icon}</div>
+  <h2 style="color:{color};margin:12px 0;">{message}</h2>
+  <a href="/order" style="display:inline-block;margin-top:8px;color:#2563eb;text-decoration:none;font-weight:600;">← Создать ещё один</a>
+</div>
+</body></html>""",
+        mimetype="text/html; charset=utf-8",
+    )
+
+
+def _render_order_form(users, error=None):
+    """HTML-форма создания заказа на производство (Local App)."""
+    user_options = "\n".join(
+        f'<option value="{u["id"]}">{u["name"]}</option>' for u in users
+    )
+    err_html = f'<div class="err">⚠️ {error}</div>' if error else ""
+    today = datetime.now().strftime("%Y-%m-%d")
+    return Response(
+        f"""<!DOCTYPE html>
+<html lang="ru"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Заказы на производство</title>
+<script src="//api.bitrix24.com/api/v1/"></script>
+<style>
+  :root {{
+    --bx-blue:#7b2db0; --bx-blue-dark:#5f1f8f; --bx-bg:#eef2f4;
+    --bx-border:#dfe5ec; --bx-text:#1e2734; --bx-muted:#7d8a99;
+  }}
+  * {{ box-sizing:border-box; }}
+  body {{ font-family:'Helvetica Neue',Arial,system-ui,sans-serif; margin:0;
+         padding:18px; background:var(--bx-bg); color:var(--bx-text); }}
+  .card {{ max-width:600px; margin:0 auto; background:#fff; border:1px solid var(--bx-border);
+           border-radius:14px; overflow:hidden; box-shadow:0 2px 10px rgba(31,49,71,.06); }}
+  .head {{ display:flex; align-items:center; gap:12px; padding:20px 24px;
+           background:linear-gradient(135deg,var(--bx-blue),var(--bx-blue-dark)); color:#fff; }}
+  .head .ic {{ font-size:26px; line-height:1; }}
+  .head h1 {{ font-size:19px; margin:0; font-weight:600; }}
+  .head .tag {{ font-size:12px; opacity:.85; margin-top:2px; }}
+  .body {{ padding:22px 24px 26px; }}
+  label {{ display:block; font-size:13px; font-weight:600; margin:16px 0 6px; }}
+  .hint {{ font-weight:400; color:var(--bx-muted); }}
+  input, select, textarea {{ width:100%; padding:11px 13px; font-size:15px; color:var(--bx-text);
+           border:1px solid var(--bx-border); border-radius:9px; background:#fff;
+           transition:border-color .15s, box-shadow .15s; }}
+  input:focus, select:focus, textarea:focus {{ outline:none; border-color:var(--bx-blue);
+           box-shadow:0 0 0 3px rgba(123,45,176,.12); }}
+  textarea {{ resize:vertical; min-height:62px; }}
+  .row {{ display:flex; gap:14px; }}
+  .row > div {{ flex:1; }}
+  .file {{ border:1px dashed var(--bx-border); border-radius:9px; padding:11px 13px;
+           background:var(--bx-bg); }}
+  button {{ width:100%; margin-top:24px; padding:14px; font-size:16px; font-weight:600;
+           color:#fff; background:var(--bx-blue); border:0; border-radius:10px; cursor:pointer;
+           transition:background .15s; }}
+  button:hover {{ background:var(--bx-blue-dark); }}
+  button:disabled {{ background:#b89cd4; cursor:default; }}
+  .err {{ background:#fdecec; color:#c0392b; padding:11px 13px; border-radius:9px;
+          font-size:14px; margin-bottom:14px; }}
+  .req {{ color:#c0392b; }}
+  select.urgent {{ border-color:#e0392b; color:#c0392b; background:#fdecec;
+           font-weight:700; box-shadow:0 0 0 3px rgba(224,57,43,.12); }}
+  select.urgent:focus {{ border-color:#e0392b; box-shadow:0 0 0 3px rgba(224,57,43,.2); }}
+  @keyframes urgPulse {{ 0%,100%{{box-shadow:0 0 0 3px rgba(224,57,43,.12);}}
+           50%{{box-shadow:0 0 0 5px rgba(224,57,43,.28);}} }}
+  select.urgent {{ animation:urgPulse 1.2s ease-in-out infinite; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="head">
+    <div class="ic">🏭</div>
+    <div>
+      <h1>Заказы на производство</h1>
+      <div class="tag">Новый заказ на согласование</div>
+    </div>
+  </div>
+  <div class="body">
+    {err_html}
+    <form method="POST" action="/order/submit" enctype="multipart/form-data"
+          onsubmit="var b=this.querySelector('button');b.disabled=true;b.textContent='Отправляем…';">
+
+      <label>Заявитель <span class="req">*</span>
+        <span class="hint" id="reqAutoNote" style="display:none">— определён автоматически</span>
+      </label>
+      <select id="requesterSelect" disabled style="background:#f4f6f8;cursor:not-allowed;">
+        <option value="" selected>— определяется автоматически —</option>
+        {user_options}
+      </select>
+      <input type="hidden" name="requester_id" id="requesterIdHidden">
+      <div class="hint" id="reqManualNote" style="display:none;margin-top:6px;">
+        Не удалось определить автоматически — выберите себя из списка.
+      </div>
+
+      <div class="row">
+        <div>
+          <label>Дата заказа <span class="req">*</span></label>
+          <input type="date" name="order_date" value="{today}" required>
+        </div>
+        <div>
+          <label>Срок (дедлайн) <span class="req">*</span></label>
+          <input type="date" name="deadline" required>
+        </div>
+      </div>
+
+      <label>Артикул / модель <span class="req">*</span></label>
+      <input type="text" name="model" placeholder="Напр.: худи Joto Classic, арт. JT-001" required>
+
+      <label>Размерный ряд и количество <span class="req">*</span>
+        <span class="hint">— размер и сколько штук</span>
+      </label>
+      <textarea name="sizes" placeholder="Напр.: S — 10, M — 20, L — 20, XL — 10" required></textarea>
+
+      <div class="row">
+        <div>
+          <label>Цвет(а) <span class="req">*</span></label>
+          <input type="text" name="color" placeholder="Чёрный / молочный" required>
+        </div>
+        <div>
+          <label>Общий тираж <span class="req">*</span></label>
+          <input type="text" name="quantity" inputmode="numeric" placeholder="60" required>
+        </div>
+      </div>
+
+      <label>Ткань (материал, состав) <span class="req">*</span></label>
+      <input type="text" name="fabric" placeholder="Напр.: футер 3-нитка, 80% хлопок / 20% ПЭ, 330 г/м²" required>
+
+      <label>Фурнитура <span class="req">*</span></label>
+      <input type="text" name="accessories" placeholder="Напр.: люверсы, шнур, бирки, размерники" required>
+
+      <label>Подрядчик / цех <span class="req">*</span></label>
+      <input type="text" name="contractor" placeholder="Кто шьёт" required>
+
+      <label>Срочность <span class="req">*</span></label>
+      <select name="urgency" id="urgencySelect" required onchange="syncUrgency()">
+        <option value="Не срочный" selected>🟢 Не срочный</option>
+        <option value="Срочный">🔴 СРОЧНЫЙ — нужно как можно скорее</option>
+      </select>
+
+      <label>Образец нужен? <span class="req">*</span></label>
+      <select name="sample" required>
+        <option value="Да">Да — сначала образец</option>
+        <option value="Нет" selected>Нет — сразу в тираж</option>
+      </select>
+
+      <label>Файлы <span class="hint">— лекало / макет / тех.задание (можно несколько)</span></label>
+      <div class="file"><input type="file" name="files" multiple
+           accept=".pdf,.jpg,.jpeg,.png,.ai,.cdr,.zip,.rar,.xlsx,.docx"
+           style="border:0;padding:0;background:transparent;"></div>
+
+      <label>Комментарий</label>
+      <textarea name="comment" placeholder="Доп. пожелания, детали отшива и т.п."></textarea>
+
+      <button type="submit">Отправить на согласование</button>
+    </form>
+  </div>
+</div>
+<script>
+  function syncUrgency() {{
+    var u = document.getElementById('urgencySelect');
+    if (u.value === 'Срочный') {{ u.classList.add('urgent'); }}
+    else {{ u.classList.remove('urgent'); }}
+  }}
+  syncUrgency();
+
+  var sel    = document.getElementById('requesterSelect');
+  var hidden = document.getElementById('requesterIdHidden');
+
+  function enableManual() {{
+    sel.disabled = false;
+    sel.style.background = '#fff';
+    sel.style.cursor = 'pointer';
+    sel.setAttribute('required', 'required');
+    document.getElementById('reqManualNote').style.display = 'block';
+    sel.addEventListener('change', function() {{ hidden.value = sel.value; }});
+  }}
+
+  try {{
+    if (window.BX24) {{
+      var done = false;
+      BX24.init(function() {{
+        try {{ BX24.fitWindow(); }} catch(e) {{}}
+        try {{
+          BX24.callMethod('user.current', {{}}, function(res) {{
+            if (res.error()) {{ if (!done) enableManual(); return; }}
+            var u = res.data();
+            if (u && u.ID) {{
+              if (!sel.querySelector('option[value="' + u.ID + '"]')) {{
+                var o = document.createElement('option');
+                o.value = u.ID;
+                o.textContent = ((u.NAME||'') + ' ' + (u.LAST_NAME||'')).trim() || ('ID ' + u.ID);
+                sel.appendChild(o);
+              }}
+              sel.value = u.ID;
+              hidden.value = u.ID;
+              document.getElementById('reqAutoNote').style.display = 'inline';
+              done = true;
+            }} else if (!done) {{ enableManual(); }}
+          }});
+        }} catch(e) {{ enableManual(); }}
+      }});
+      setTimeout(function() {{ if (!done && !hidden.value) enableManual(); }}, 4000);
+    }} else {{
+      enableManual();
+    }}
+  }} catch(e) {{ enableManual(); }}
+</script>
+</body></html>""",
+        mimetype="text/html; charset=utf-8",
+    )
+
+
+@app.route("/order", methods=["GET", "POST"])
+def order_form_route():
+    """Local Application: форма создания заказа на производство."""
+    users = fetch_active_users()
+    return _render_order_form(users)
+
+
+@app.route("/order/submit", methods=["POST"])
+def order_submit_route():
+    """Приём заказа: загрузка файлов, запись в Sheets, уведомление Алану в чат."""
+    try:
+        form = request.form
+        requester_id = (form.get("requester_id") or "").strip()
+        order_date   = (form.get("order_date") or "").strip()
+        deadline     = (form.get("deadline") or "").strip()
+        model        = (form.get("model") or "").strip()
+        sizes        = (form.get("sizes") or "").strip()
+        color        = (form.get("color") or "").strip()
+        quantity     = (form.get("quantity") or "").strip()
+        fabric       = (form.get("fabric") or "").strip()
+        accessories  = (form.get("accessories") or "").strip()
+        contractor   = (form.get("contractor") or "").strip()
+        urgency      = (form.get("urgency") or "Не срочный").strip()
+        sample       = (form.get("sample") or "").strip()
+        comment      = (form.get("comment") or "").strip()
+        is_urgent    = urgency == "Срочный"
+
+        required = [requester_id, order_date, deadline, model, sizes, color,
+                    quantity, fabric, accessories, contractor, sample]
+        if not all(required):
+            return _render_order_result(False, "Заполнены не все обязательные поля")
+
+        requester_name = resolve_user_name(requester_id)
+        approver = resolve_approver()
+
+        # Файлы (лекало / макет / тех.задание) → Bitrix Drive.
+        file_links = []
+        for f in request.files.getlist("files"):
+            if f and f.filename:
+                link = upload_invoice_to_disk(f.filename, f.read())
+                if link:
+                    file_links.append(link)
+        files_str = "\n".join(file_links)
+
+        # Уникальный ID заказа — связывает строку таблицы, сообщение и кнопки.
+        rid = uuid.uuid4().hex[:12]
+
+        message_id = None
+        if PRODUCTION_CHAT_ID:
+            header = ("🔴 [B]СРОЧНЫЙ заказ на производство[/B] 🔴" if is_urgent
+                      else "🏭 [B]Новый заказ на производство[/B]")
+            lines = [
+                header,
+                f"👤 Заявитель: {requester_name}",
+                f"🏷 Артикул / модель: {model}",
+                f"📐 Размеры и кол-во: {sizes}",
+                f"🎨 Цвет: {color}",
+                f"🧵 Ткань: {fabric}",
+                f"🔘 Фурнитура: {accessories}",
+                f"🔢 Тираж: {quantity}",
+                f"🏭 Подрядчик / цех: {contractor}",
+                f"📅 Дата заказа: {order_date}",
+                f"⏰ Дедлайн: {deadline}",
+                f"🚦 Срочность: {'🔴 СРОЧНЫЙ' if is_urgent else '🟢 Не срочный'}",
+                f"🧪 Образец: {sample}",
+                f"💬 Комментарий: {comment or '—'}",
+            ]
+            for i, link in enumerate(file_links, 1):
+                lines.append(f"📎 Файл {i}: {link}")
+            lines.append("")
+            approver_tag = (f"[USER={approver['id']}]{approver['name']}[/USER]"
+                            if approver["id"] else approver["name"])
+            lines.append(f"{approver_tag}, нужно согласовать заказ 🙏")
+            keyboard = [
+                {
+                    "TEXT": "✅ Согласовать",
+                    "LINK": f"{APP_PUBLIC_URL}/order/approve?rid={rid}&action=approve",
+                    "BG_COLOR": "#27ae60",
+                    "TEXT_COLOR": "#ffffff",
+                    "DISPLAY": "LINE",
+                },
+                {
+                    "TEXT": "❌ Отклонить",
+                    "LINK": f"{APP_PUBLIC_URL}/order/approve?rid={rid}&action=reject",
+                    "BG_COLOR": "#eb5757",
+                    "TEXT_COLOR": "#ffffff",
+                    "DISPLAY": "LINE",
+                },
+            ]
+            message_id = send_message(PRODUCTION_CHAT_ID, "\n".join(lines), keyboard=keyboard)
+        else:
+            print("PRODUCTION_CHAT_ID не задан — уведомление в чат не отправлено")
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        append_order_row([
+            now, requester_name, order_date, model, sizes, color, fabric,
+            accessories, quantity, contractor, deadline, urgency, sample,
+            files_str or "—", comment or "—", "На согласовании",
+            rid, requester_id, str(approver["id"] or ""), str(message_id or ""), "—",
+        ])
+
+        return _render_order_result(True, "Заказ отправлен на согласование")
+    except Exception as e:
+        print(f"order_submit_route error: {e}")
+        return _render_order_result(False, "Не удалось создать заказ. Попробуйте ещё раз.")
+
+
+@app.route("/order/approve", methods=["GET"])
+def order_approve_route():
+    """Страница согласования/отклонения заказа (по кнопке в чате).
+
+    Определяет нажавшего через BX24 (user.current) и отправляет решение на
+    /order/approve/confirm. Согласовать/отклонить может только согласующий (Алан).
+    """
+    rid = (request.args.get("rid") or "").strip()
+    action = (request.args.get("action") or "approve").strip()
+    is_reject = action == "reject"
+    title = "Отклонение заказа…" if is_reject else "Согласование заказа…"
+    return Response(
+        f"""<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Согласование заказа</title>
+<script src="//api.bitrix24.com/api/v1/"></script>
+<style>
+  body {{ font-family:system-ui,Arial,sans-serif; background:#eef2f4; margin:0; padding:24px; color:#1e2734; }}
+  .card {{ max-width:440px; margin:32px auto; background:#fff; border-radius:14px;
+           padding:28px 24px; text-align:center; box-shadow:0 2px 10px rgba(31,49,71,.08); }}
+  .ic {{ font-size:46px; }}
+  h2 {{ margin:14px 0 6px; font-size:19px; }}
+  p {{ color:#5b6b7d; font-size:14px; margin:8px 0; }}
+</style></head>
+<body>
+<div class="card">
+  <div class="ic" id="ic">⏳</div>
+  <h2 id="title">{title}</h2>
+  <p id="msg">Определяем пользователя…</p>
+</div>
+<script>
+  var RID = {json.dumps(rid)};
+  var ACTION = {json.dumps('reject' if is_reject else 'approve')};
+  function show(ic, title, msg) {{
+    document.getElementById('ic').textContent = ic;
+    document.getElementById('title').textContent = title;
+    document.getElementById('msg').textContent = msg;
+  }}
+  function doConfirm(uid) {{
+    var fd = new FormData();
+    fd.append('rid', RID);
+    fd.append('action', ACTION);
+    fd.append('user_id', uid || '');
+    fetch('/order/approve/confirm', {{ method:'POST', body:fd }})
+      .then(function(r) {{ return r.json(); }})
+      .then(function(d) {{
+        if (d.ok) {{ show('✅', d.title || 'Готово', d.message || ''); }}
+        else {{ show('⚠️', 'Не выполнено', d.message || 'Ошибка'); }}
+        try {{ if (window.BX24) BX24.fitWindow(); }} catch(e) {{}}
+      }})
+      .catch(function() {{ show('⚠️', 'Ошибка', 'Не удалось связаться с сервером'); }});
+  }}
+  try {{
+    if (window.BX24) {{
+      BX24.init(function() {{
+        try {{ BX24.fitWindow(); }} catch(e) {{}}
+        BX24.callMethod('user.current', {{}}, function(res) {{
+          if (res.error()) {{ show('⚠️','Ошибка','Не удалось определить пользователя'); return; }}
+          var u = res.data();
+          doConfirm(u && u.ID ? u.ID : '');
+        }});
+      }});
+    }} else {{
+      show('⚠️','Откройте из Битрикса','Кнопку нужно нажимать внутри Битрикс24.');
+    }}
+  }} catch(e) {{ show('⚠️','Ошибка', String(e)); }}
+</script>
+</body></html>""",
+        mimetype="text/html; charset=utf-8",
+    )
+
+
+@app.route("/order/approve/confirm", methods=["POST"])
+def order_approve_confirm_route():
+    """Выполняет согласование/отклонение: проверяет, что нажал Алан, ставит
+    статус, правит сообщение, при согласовании — создаёт элемент в CRM."""
+    try:
+        rid     = (request.form.get("rid") or "").strip()
+        action  = (request.form.get("action") or "approve").strip()
+        user_id = (request.form.get("user_id") or "").strip()
+        is_reject = action == "reject"
+        if not rid:
+            return jsonify({"ok": False, "message": "Не указан ID заказа"})
+
+        row_number, values = find_order_row_by_rid(rid)
+        if not row_number:
+            return jsonify({"ok": False, "message": "Заказ не найден"})
+
+        def cell(i):
+            return (values[i] if len(values) > i else "").strip()
+
+        status       = cell(15)
+        approver_id  = cell(18)
+        message_id   = cell(19)
+        requester_nm = cell(1)
+        model        = cell(3)
+        quantity     = cell(8)
+
+        if status in ("Согласован", "Отклонён"):
+            return jsonify({"ok": False, "message": f"Заказ уже обработан (статус: {status})"})
+
+        # Согласовать/отклонить может только согласующий (Алан).
+        approver_nm = resolve_user_name(approver_id) if approver_id else (
+            PRODUCTION_APPROVER_NAMES[0] if PRODUCTION_APPROVER_NAMES else "согласующий")
+        if not user_id or (approver_id and str(user_id) != str(approver_id)):
+            return jsonify({
+                "ok": False,
+                "message": f"Согласовать может только {approver_nm}",
+            })
+
+        if is_reject:
+            set_order_status(row_number, "Отклонён")
+            if message_id:
+                update_bot_message(message_id, "\n".join([
+                    "❌ [B]ЗАКАЗ ОТКЛОНЁН[/B]",
+                    f"👤 Заявитель: {requester_nm}",
+                    f"🏷 Модель: {model}",
+                    f"🔢 Тираж: {quantity}",
+                    "",
+                    f"[I]Отклонил: {approver_nm}[/I]",
+                ]))
+            if PRODUCTION_CHAT_ID:
+                send_message(PRODUCTION_CHAT_ID, "\n".join([
+                    "❌ [B]Заказ отклонён[/B]",
+                    f"👤 Заявитель: {requester_nm}",
+                    f"🏷 Модель: {model}",
+                    f"🔢 Тираж: {quantity}",
+                ]))
+            return jsonify({"ok": True, "title": "Заказ отклонён",
+                            "message": "Статус обновлён"})
+
+        # Согласование: статус → «Согласован», создаём элемент в CRM.
+        set_order_status(row_number, "Согласован")
+        order = {
+            "requester":   requester_nm,
+            "order_date":  cell(2),
+            "model":       model,
+            "sizes":       cell(4),
+            "color":       cell(5),
+            "fabric":      cell(6),
+            "accessories": cell(7),
+            "quantity":    quantity,
+            "contractor":  cell(9),
+            "deadline":    cell(10),
+            "urgency":     cell(11),
+            "sample":      cell(12),
+            "files":       cell(13),
+            "comment":     cell(14),
+        }
+        crm_link = create_crm_order_item(order)
+        if crm_link:
+            set_order_crm_link(row_number, crm_link)
+
+        if message_id:
+            done_lines = [
+                "✅ [B]ЗАКАЗ СОГЛАСОВАН[/B]",
+                f"👤 Заявитель: {requester_nm}",
+                f"🏷 Модель: {model}",
+                f"🔢 Тираж: {quantity}",
+                "",
+                f"[I]Согласовал: {approver_nm}[/I]",
+            ]
+            if crm_link:
+                done_lines.append(f"📋 Карточка в CRM: {crm_link}")
+            update_bot_message(message_id, "\n".join(done_lines))
+
+        if PRODUCTION_CHAT_ID:
+            notify = [
+                "✅ [B]Заказ согласован — в производство[/B]",
+                f"👤 Заявитель: {requester_nm}",
+                f"🏷 Модель: {model}",
+                f"🔢 Тираж: {quantity}",
+            ]
+            if crm_link:
+                notify.append(f"📋 CRM: {crm_link}")
+            send_message(PRODUCTION_CHAT_ID, "\n".join(notify))
+
+        msg = "Заказ согласован" + (" и заведён в CRM" if crm_link else "")
+        return jsonify({"ok": True, "title": "Заказ согласован", "message": msg})
+    except Exception as e:
+        print(f"order_approve_confirm_route error: {e}")
+        return jsonify({"ok": False, "message": "Внутренняя ошибка"})
+
+
 @app.route("/categories", methods=["GET"])
 def categories_route():
     """Страница управления категориями заявок: список + добавить/удалить."""
@@ -2487,6 +3211,54 @@ def install_app_route():
 <body style="font-family:system-ui,sans-serif;max-width:560px;margin:40px auto;padding:24px;">
 <h2 style="color:#28a745;">✅ Приложение «Платежи» установлено</h2>
 <p>Открой пункт <b>«Платежи»</b> в левом меню — заявитель определится автоматически.</p>
+<script>try{if(window.BX24){BX24.init(function(){try{BX24.installFinish();}catch(e){}});}}catch(e){}</script>
+</body></html>""",
+        mimetype="text/html; charset=utf-8",
+    )
+
+
+@app.route("/install-order-app", methods=["GET", "POST"])
+def install_order_app_route():
+    """Установка Local App «Заказы на производство».
+
+    Как и «Платежи», само Локальное приложение добавляет пункт левого меню
+    (через поле «Название пункта меню» с handler-URL `/order`), поэтому отдельный
+    placement.bind здесь НЕ нужен — иначе появится дубль. Просто завершаем
+    установку (installFinish) и подчищаем возможную старую LEFT_MENU-привязку.
+    """
+    if request.method == "GET":
+        return Response(
+            """<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">
+<script src="//api.bitrix24.com/api/v1/"></script></head>
+<body style="font-family:system-ui,sans-serif;max-width:560px;margin:40px auto;padding:24px;">
+<h2>Заказы на производство</h2>
+<p>Это обработчик установки Local App. Откройте установку из Битрикса.</p>
+</body></html>""",
+            mimetype="text/html; charset=utf-8",
+        )
+
+    data = parse_request_data()
+    auth = parse_auth_from_event(data)
+    access_token = auth.get("access_token") or str(data.get("AUTH_ID") or "")
+    client_endpoint = auth.get("client_endpoint") or derive_client_endpoint(auth.get("domain"))
+
+    if access_token and client_endpoint:
+        try:
+            requests.post(
+                f"{client_endpoint.rstrip('/')}/placement.unbind.json",
+                data={"auth": access_token, "PLACEMENT": "LEFT_MENU",
+                      "HANDLER": f"{APP_PUBLIC_URL}/order"},
+                timeout=10,
+            )
+        except Exception as e:
+            print(f"install-order-app unbind error (ignored): {e}")
+
+    return Response(
+        """<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">
+<script src="//api.bitrix24.com/api/v1/"></script></head>
+<body style="font-family:system-ui,sans-serif;max-width:560px;margin:40px auto;padding:24px;">
+<h2 style="color:#7b2db0;">✅ Приложение «Заказы на производство» установлено</h2>
+<p>Открой пункт <b>«Заказы на производство»</b> в левом меню — заявитель определится автоматически.</p>
 <script>try{if(window.BX24){BX24.init(function(){try{BX24.installFinish();}catch(e){}});}}catch(e){}</script>
 </body></html>""",
         mimetype="text/html; charset=utf-8",
