@@ -55,12 +55,17 @@
   - **Алан** определяется по подстроке в ФИО среди активных сотрудников
     (`resolve_approver`, env `PRODUCTION_APPROVER_NAME`, дефолт «Алан»).
     ID резолвится при создании заказа и пишется в колонку S.
-  - **CRM-шаг (после согласования):** `create_crm_order_item` создаёт элемент
-    смарт-процесса (`crm.item.add`) со стадией `PRODUCTION_SPA_STAGE_ID`,
-    полные детали заказа — комментарием в таймлайн (`crm.timeline.comment.add`),
-    ссылка на карточку пишется в колонку U и в чат. **Best-effort:** если
-    `PRODUCTION_SPA_ENTITY_TYPE_ID` не задан — CRM-шаг тихо пропускается, заказ
-    всё равно фиксируется в Sheets/чате.
+  - **CRM-шаг (после согласования):** `create_crm_order_item` — диспетчер по
+    `PRODUCTION_CRM_MODE`. **У нас режим `deal`** (заказчик: «настроена ВОРОНКА
+    заказы на производство» = направление Сделок). `_crm_create_deal` →
+    `crm.deal.add` с `CATEGORY_ID`=`PRODUCTION_DEAL_CATEGORY_ID`,
+    `STAGE_ID`=`PRODUCTION_DEAL_STAGE_ID`, полные детали в поле `COMMENTS`.
+    Ссылка на сделку пишется в колонку U и в чат. Режим `spa` (`_crm_create_spa`,
+    `crm.item.add` + таймлайн) оставлен на случай смарт-процесса. **Best-effort:**
+    нет нужных ID / scope — CRM-шаг тихо пропускается, заказ всё равно в Sheets/чате.
+  - **`/order/crm-info`** — диагностическая страница: перечисляет воронки Сделок
+    с их `CATEGORY_ID` и стадиями (`STATUS_ID` = `STAGE_ID`), плюс смарт-процессы.
+    Нужна, чтобы узнать точные ID для Railway. Требует у вебхука scope `crm`.
   - **Левое меню:** добавлен `/install-order-app` (install-finish для Local App
     «Заказы на производство»). placement.bind программно НЕ дёргаем (как у
     «Платежей») — пункт меню создаёт сам Local App через поле «Название пункта».
@@ -73,12 +78,13 @@
       handler-URL пункта меню = `https://dds-bot-production.up.railway.app/order`,
       install-handler = `.../install-order-app`, название пункта меню «Заказы на
       производство». Тогда слева появится пункт, как «Платежи».
-- [ ] **Настроить CRM (для стадий):** создать смарт-процесс «Заказы на
-      производство», узнать его `entityTypeId`, нужную стадию `stageId`
-      (и `categoryId`, если есть воронки). Прописать в Railway env:
-      `PRODUCTION_SPA_ENTITY_TYPE_ID`, `PRODUCTION_SPA_STAGE_ID`,
-      `PRODUCTION_SPA_CATEGORY_ID`. Вебхуку нужен scope `crm` — если у общего
-      `BITRIX_WEBHOOK_URL` его нет, завести `BITRIX_CRM_WEBHOOK_URL`.
+- [ ] **Настроить CRM (режим `deal`, воронка уже есть):** открыть
+      `https://dds-bot-production.up.railway.app/order/crm-info`, найти воронку
+      «Заказы на производство», скопировать её `CATEGORY_ID` и `STAGE_ID` нужной
+      стадии. Прописать в Railway env: `PRODUCTION_DEAL_CATEGORY_ID`,
+      `PRODUCTION_DEAL_STAGE_ID` (режим по умолчанию уже `deal`). Вебхуку нужен
+      scope `crm` — если у общего `BITRIX_WEBHOOK_URL` его нет, завести
+      `BITRIX_CRM_WEBHOOK_URL` со scope `crm`.
 - [ ] Проверить, что Алан — участник чата `PRODUCTION_CHAT_ID` (иначе тег и
       кнопки до него «не дойдут» как надо).
 

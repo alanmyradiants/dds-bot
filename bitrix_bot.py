@@ -67,11 +67,22 @@ PRODUCTION_APPROVER_NAMES = [
     if n.strip()
 ]
 
-# Интеграция с CRM: после согласования создаём элемент смарт-процесса и ставим
-# стадию. Всё best-effort — если PRODUCTION_SPA_ENTITY_TYPE_ID не задан, CRM-шаг
-# просто пропускается, а заказ всё равно фиксируется в Google Sheets и чате.
-# Вебхуку нужен scope `crm`; по умолчанию берём общий BITRIX_WEBHOOK_URL.
-BITRIX_CRM_WEBHOOK_URL        = os.getenv("BITRIX_CRM_WEBHOOK_URL", BITRIX_WEBHOOK_URL).rstrip("/")
+# Интеграция с CRM: после согласования создаём объект в CRM и ставим стадию.
+# Всё best-effort — если CRM не настроена, CRM-шаг просто пропускается, а заказ
+# всё равно фиксируется в Google Sheets и чате. Вебхуку нужен scope `crm`;
+# по умолчанию берём общий BITRIX_WEBHOOK_URL.
+BITRIX_CRM_WEBHOOK_URL = os.getenv("BITRIX_CRM_WEBHOOK_URL", BITRIX_WEBHOOK_URL).rstrip("/")
+
+# Режим CRM: "deal" — создавать СДЕЛКУ в воронке (у нас настроена воронка
+# «Заказы на производство»); "spa" — элемент смарт-процесса; "" / "off" — выкл.
+PRODUCTION_CRM_MODE = os.getenv("PRODUCTION_CRM_MODE", "deal").strip().lower()
+
+# Для режима "deal": воронка (направление) и стадия, на которую ставим заказ
+# после согласования. ID можно подсмотреть на странице /order/crm-info.
+PRODUCTION_DEAL_CATEGORY_ID = os.getenv("PRODUCTION_DEAL_CATEGORY_ID", "").strip()
+PRODUCTION_DEAL_STAGE_ID    = os.getenv("PRODUCTION_DEAL_STAGE_ID", "").strip()
+
+# Для режима "spa": смарт-процесс.
 PRODUCTION_SPA_ENTITY_TYPE_ID = os.getenv("PRODUCTION_SPA_ENTITY_TYPE_ID", "").strip()
 PRODUCTION_SPA_CATEGORY_ID    = os.getenv("PRODUCTION_SPA_CATEGORY_ID", "").strip()
 PRODUCTION_SPA_STAGE_ID       = os.getenv("PRODUCTION_SPA_STAGE_ID", "").strip()
@@ -2500,23 +2511,78 @@ def set_order_crm_link(row_number, link):
         print(f"set_order_crm_link error: {e}")
 
 
-def create_crm_order_item(order):
-    """Создаёт элемент смарт-процесса CRM по согласованному заказу.
+def _order_title(order):
+    title = f"Заказ: {order.get('model') or '—'}"
+    if order.get("quantity"):
+        title += f" · {order['quantity']} шт"
+    return title
 
-    Best-effort: если PRODUCTION_SPA_ENTITY_TYPE_ID не задан или CRM-вебхук без
-    scope `crm` — тихо возвращает "" (заказ всё равно зафиксирован в Sheets/чате).
-    Возвращает ссылку на карточку (или ID элемента) для уведомления, либо "".
 
-    order — dict с полями заказа (см. вызов в /order/approve/confirm).
+def _order_details_text(order):
+    """Полные детали заказа одним текстом — для COMMENTS сделки / таймлайна."""
+    return "\n".join([
+        "Заказ на производство (согласован):",
+        f"Заявитель: {order.get('requester') or '—'}",
+        f"Дата заказа: {order.get('order_date') or '—'}",
+        f"Артикул / модель: {order.get('model') or '—'}",
+        f"Размерный ряд и количество: {order.get('sizes') or '—'}",
+        f"Цвет: {order.get('color') or '—'}",
+        f"Ткань (состав): {order.get('fabric') or '—'}",
+        f"Фурнитура: {order.get('accessories') or '—'}",
+        f"Общий тираж: {order.get('quantity') or '—'}",
+        f"Подрядчик / цех: {order.get('contractor') or '—'}",
+        f"Срок (дедлайн): {order.get('deadline') or '—'}",
+        f"Срочность: {order.get('urgency') or '—'}",
+        f"Образец нужен: {order.get('sample') or '—'}",
+        f"Файлы: {order.get('files') or '—'}",
+        f"Комментарий: {order.get('comment') or '—'}",
+    ])
+
+
+def _crm_create_deal(order):
+    """Создаёт СДЕЛКУ в воронке «Заказы на производство» на нужной стадии.
+
+    Полные детали кладём в поле COMMENTS сделки. Возвращает ссылку на сделку.
     """
-    if not PRODUCTION_SPA_ENTITY_TYPE_ID:
-        print("create_crm_order_item: PRODUCTION_SPA_ENTITY_TYPE_ID не задан — CRM-шаг пропущен")
+    if not (PRODUCTION_DEAL_CATEGORY_ID or PRODUCTION_DEAL_STAGE_ID):
+        print("_crm_create_deal: не задан PRODUCTION_DEAL_CATEGORY_ID/STAGE_ID — CRM-шаг пропущен")
         return ""
     try:
-        title = f"Заказ: {order.get('model') or '—'}"
-        if order.get("quantity"):
-            title += f" · {order['quantity']} шт"
-        fields = {"title": title}
+        fields = {
+            "TITLE":    _order_title(order),
+            "COMMENTS": _order_details_text(order),
+            "OPENED":   "Y",
+        }
+        if PRODUCTION_DEAL_CATEGORY_ID:
+            fields["CATEGORY_ID"] = PRODUCTION_DEAL_CATEGORY_ID
+        if PRODUCTION_DEAL_STAGE_ID:
+            fields["STAGE_ID"] = PRODUCTION_DEAL_STAGE_ID
+
+        resp = bitrix_crm_post("crm.deal.add", {"fields": fields}, timeout=20)
+        if resp.status_code != 200:
+            print(f"crm.deal.add status={resp.status_code} body={safe_preview(resp.text,300)}")
+            return ""
+        data = resp.json()
+        if data.get("error"):
+            print(f"crm.deal.add error: {safe_preview(data,300)}")
+            return ""
+        deal_id = data.get("result")
+        if not deal_id:
+            return ""
+        portal = BITRIX_WEBHOOK_URL.split("/rest/")[0]
+        return f"{portal}/crm/deal/details/{deal_id}/"
+    except Exception as e:
+        print(f"_crm_create_deal error: {e}")
+        return ""
+
+
+def _crm_create_spa(order):
+    """Создаёт элемент смарт-процесса CRM. Детали — комментарием в таймлайн."""
+    if not PRODUCTION_SPA_ENTITY_TYPE_ID:
+        print("_crm_create_spa: не задан PRODUCTION_SPA_ENTITY_TYPE_ID — CRM-шаг пропущен")
+        return ""
+    try:
+        fields = {"title": _order_title(order)}
         if PRODUCTION_SPA_CATEGORY_ID:
             fields["categoryId"] = PRODUCTION_SPA_CATEGORY_ID
         if PRODUCTION_SPA_STAGE_ID:
@@ -2538,47 +2604,37 @@ def create_crm_order_item(order):
         item_id = item.get("id")
         if not item_id:
             return ""
-
-        # Полные детали заказа — комментарием в таймлайн карточки (надёжно,
-        # не зависит от набора пользовательских полей смарт-процесса).
-        details = "\n".join([
-            "Заказ на производство (согласован):",
-            f"Заявитель: {order.get('requester') or '—'}",
-            f"Дата заказа: {order.get('order_date') or '—'}",
-            f"Артикул / модель: {order.get('model') or '—'}",
-            f"Размерный ряд и количество: {order.get('sizes') or '—'}",
-            f"Цвет: {order.get('color') or '—'}",
-            f"Ткань (состав): {order.get('fabric') or '—'}",
-            f"Фурнитура: {order.get('accessories') or '—'}",
-            f"Общий тираж: {order.get('quantity') or '—'}",
-            f"Подрядчик / цех: {order.get('contractor') or '—'}",
-            f"Срок (дедлайн): {order.get('deadline') or '—'}",
-            f"Срочность: {order.get('urgency') or '—'}",
-            f"Образец нужен: {order.get('sample') or '—'}",
-            f"Файлы: {order.get('files') or '—'}",
-            f"Комментарий: {order.get('comment') or '—'}",
-        ])
         try:
             bitrix_crm_post(
                 "crm.timeline.comment.add",
                 {"fields": {
                     "ENTITY_ID": item_id,
                     "ENTITY_TYPE": f"DYNAMIC_{PRODUCTION_SPA_ENTITY_TYPE_ID}",
-                    "COMMENT": details,
+                    "COMMENT": _order_details_text(order),
                 }},
                 timeout=20,
             )
         except Exception as e:
             print(f"crm.timeline.comment.add error (ignored): {e}")
-
-        # Ссылка на карточку смарт-процесса.
         portal = BITRIX_WEBHOOK_URL.split("/rest/")[0]
-        link = (f"{portal}/crm/type/{PRODUCTION_SPA_ENTITY_TYPE_ID}"
-                f"/details/{item_id}/")
-        return link
+        return f"{portal}/crm/type/{PRODUCTION_SPA_ENTITY_TYPE_ID}/details/{item_id}/"
     except Exception as e:
-        print(f"create_crm_order_item error: {e}")
+        print(f"_crm_create_spa error: {e}")
         return ""
+
+
+def create_crm_order_item(order):
+    """Создаёт объект в CRM по согласованному заказу (сделка или смарт-процесс).
+
+    Режим — PRODUCTION_CRM_MODE. Best-effort: при любой ошибке/выкл. CRM возвращает
+    "" (заказ всё равно зафиксирован в Sheets/чате). Возвращает ссылку на карточку.
+    """
+    if PRODUCTION_CRM_MODE == "deal":
+        return _crm_create_deal(order)
+    if PRODUCTION_CRM_MODE in ("spa", "smart", "item"):
+        return _crm_create_spa(order)
+    print(f"create_crm_order_item: PRODUCTION_CRM_MODE='{PRODUCTION_CRM_MODE}' — CRM-шаг пропущен")
+    return ""
 
 
 def _render_order_result(ok, message):
@@ -3092,6 +3148,94 @@ def order_approve_confirm_route():
     except Exception as e:
         print(f"order_approve_confirm_route error: {e}")
         return jsonify({"ok": False, "message": "Внутренняя ошибка"})
+
+
+@app.route("/order/crm-info", methods=["GET"])
+def order_crm_info_route():
+    """Диагностика CRM: показывает воронки (направления) сделок с их ID и стадиями.
+
+    Нужна, чтобы узнать точные PRODUCTION_DEAL_CATEGORY_ID и PRODUCTION_DEAL_STAGE_ID
+    для прописывания в Railway. Также перечисляет смарт-процессы (на случай режима spa).
+    Требует у CRM-вебхука scope `crm`.
+    """
+    import html as _html
+    blocks = []
+
+    # Воронки сделок: дефолтная (ID 0) + пользовательские (crm.dealcategory.list).
+    categories = [{"ID": "0", "NAME": "Общее (воронка по умолчанию)"}]
+    try:
+        r = bitrix_crm_post("crm.dealcategory.list", {}, timeout=20)
+        body = r.json()
+        if body.get("error"):
+            blocks.append(f'<p class="err">crm.dealcategory.list: {_html.escape(str(body))}</p>')
+        for c in body.get("result", []) or []:
+            categories.append({"ID": str(c.get("ID")), "NAME": c.get("NAME") or f"ID {c.get('ID')}"})
+    except Exception as e:
+        blocks.append(f'<p class="err">crm.dealcategory.list error: {_html.escape(str(e))}</p>')
+
+    for c in categories:
+        cid, cname = c["ID"], c["NAME"]
+        try:
+            sr = bitrix_crm_post("crm.dealcategory.stage.list", {"id": cid}, timeout=20)
+            stages = sr.json().get("result", []) or []
+        except Exception as e:
+            stages = []
+            blocks.append(f'<p class="err">stage.list(id={cid}) error: {_html.escape(str(e))}</p>')
+        rows = "".join(
+            f"<tr><td>{_html.escape(str(s.get('NAME','')))}</td>"
+            f"<td><code>{_html.escape(str(s.get('STATUS_ID','')))}</code></td></tr>"
+            for s in stages
+        )
+        blocks.append(
+            f'<h3>🛒 Воронка: {_html.escape(cname)}</h3>'
+            f'<p>PRODUCTION_DEAL_CATEGORY_ID = <code>{_html.escape(cid)}</code></p>'
+            f'<table><tr><th>Стадия</th><th>PRODUCTION_DEAL_STAGE_ID</th></tr>{rows}</table>'
+        )
+
+    # Смарт-процессы (для режима spa) — просто перечислим с entityTypeId.
+    try:
+        tr = bitrix_crm_post("crm.type.list", {}, timeout=20)
+        types = (tr.json().get("result") or {}).get("types") or []
+        if types:
+            trows = "".join(
+                f"<tr><td>{_html.escape(str(t.get('title','')))}</td>"
+                f"<td><code>{_html.escape(str(t.get('entityTypeId','')))}</code></td></tr>"
+                for t in types
+            )
+            blocks.append(
+                '<h3>⚙️ Смарт-процессы (режим spa)</h3>'
+                '<table><tr><th>Название</th><th>entityTypeId</th></tr>'
+                f'{trows}</table>'
+            )
+    except Exception as e:
+        blocks.append(f'<p class="err">crm.type.list error: {_html.escape(str(e))}</p>')
+
+    return Response(
+        f"""<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CRM info — заказы на производство</title>
+<style>
+  body {{ font-family:system-ui,Arial,sans-serif; max-width:760px; margin:24px auto;
+         padding:0 18px; color:#1e2734; }}
+  h2 {{ color:#7b2db0; }}
+  h3 {{ margin-top:26px; }}
+  table {{ border-collapse:collapse; width:100%; margin:8px 0 18px; }}
+  th, td {{ border:1px solid #dfe5ec; padding:7px 10px; text-align:left; font-size:14px; }}
+  th {{ background:#f4f6f8; }}
+  code {{ background:#f4f6f8; padding:2px 6px; border-radius:5px; }}
+  .err {{ color:#c0392b; }}
+  .note {{ background:#fff7e6; border:1px solid #ffe0a3; padding:12px 14px; border-radius:8px; font-size:14px; }}
+</style></head>
+<body>
+<h2>🏭 CRM: воронки и стадии для заказов</h2>
+<p class="note">Найди воронку «Заказы на производство», скопируй её
+<b>PRODUCTION_DEAL_CATEGORY_ID</b> и <b>PRODUCTION_DEAL_STAGE_ID</b> нужной стадии,
+пропиши их в переменные Railway. Если таблицы пустые или красные ошибки —
+у CRM-вебхука нет scope <code>crm</code> (заведи BITRIX_CRM_WEBHOOK_URL со scope crm).</p>
+{''.join(blocks)}
+</body></html>""",
+        mimetype="text/html; charset=utf-8",
+    )
 
 
 @app.route("/categories", methods=["GET"])
