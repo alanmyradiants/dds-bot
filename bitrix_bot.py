@@ -42,6 +42,10 @@ PAYMENT_CHAT_ID = os.getenv("PAYMENT_CHAT_ID", "chat242").strip()
 # при вызове через входящий вебхук — иначе Битрикс не знает, от кого слать.
 BITRIX_BOT_ID = os.getenv("BITRIX_BOT_ID", "").strip()
 
+# Имя бот-команды для кнопки «Отменить заявку». Регистрируется через
+# /register-cancel-command; по клику Битрикс шлёт ONIMCOMMANDADD на /bot.
+CANCEL_COMMAND = "cancelpay"
+
 # Сотрудники-плательщики для поля «Кто оплачивает».
 # Каждое имя сопоставляется по подстроке в ФИО (ID знать не нужно). Несколько
 # имён через запятую → переопределяется env PAYMENT_DEFAULT_PAYER_NAME.
@@ -1493,6 +1497,48 @@ def find_recent_pdf_in_chat(dialog_id, access_token=None, limit=10):
         return None
 
 
+def handle_cancel_command(data):
+    """Обрабатывает клик по кнопке «Отменить заявку» (событие ONIMCOMMANDADD).
+
+    Битрикс присылает поля в bracket-notation, напр.:
+      data[COMMAND][0][COMMAND]        = 'cancelpay'
+      data[COMMAND][0][COMMAND_PARAMS] = '<rid>'
+      data[USER][ID]                   = <id нажавшего>
+    Разбираем устойчиво (имена индексов могут отличаться) — полный payload
+    печатается выше в логах, если что-то не совпадёт.
+    """
+    # ID заявки — из COMMAND_PARAMS.
+    rid = ""
+    command = ""
+    for k, v in data.items():
+        if k.endswith("[COMMAND_PARAMS]") and v:
+            rid = str(v).strip()
+        elif k.endswith("[COMMAND]") and v:
+            command = str(v).strip()
+
+    # Кто нажал кнопку.
+    user_id = str(data.get("data[USER][ID]") or "").strip()
+    if not user_id:
+        for k, v in data.items():
+            if (k.endswith("[FROM_USER_ID]") or k.endswith("[AUTHOR_ID]")
+                    or k.endswith("[USER_ID]")) and v:
+                user_id = str(v).strip()
+                break
+
+    print(f"[cancel-command] command={command!r} rid={rid!r} user_id={user_id!r}")
+
+    if command and command != CANCEL_COMMAND:
+        return jsonify({"result": "ok", "skipped": "other_command"})
+
+    ok, message = _do_cancel_payment(rid, user_id)
+    print(f"[cancel-command] result ok={ok} msg={message!r}")
+    # Если отменить нельзя (не заявитель / уже отменена) — личное сообщение
+    # нажавшему, чтобы он понял, почему ничего не произошло.
+    if not ok and user_id:
+        send_message(user_id, f"⚠️ {message}")
+    return jsonify({"result": "ok", "cancelled": ok})
+
+
 @app.route("/bot", methods=["GET", "POST"])
 def bot_handler():
     if request.method == "GET":
@@ -1504,6 +1550,10 @@ def bot_handler():
 
     event = data.get("event", "")
     print(f"EVENT: {event}")
+
+    # Клик по кнопке «Отменить заявку» → бот-команда ONIMCOMMANDADD.
+    if event == "ONIMCOMMANDADD":
+        return handle_cancel_command(data)
 
     if event not in ("ONIMBOTMESSAGEADD", "ONIMJOINCHAT"):
         return jsonify({"result": "ok", "skipped": True})
@@ -2231,11 +2281,14 @@ def payment_submit_route():
                 lines.append(f"📎 [url={file_link}]Открыть счёт[/url]")
             lines.append("")
             lines.append(f"[USER={payer_id}]{payer_name}[/USER], нужно оплатить 🙏")
-            # Кнопка отмены: открывает страницу /pay/cancel, где заявитель
-            # подтверждает отмену (проверка автора через BX24).
+            # Кнопка отмены — это БОТ-КОМАНДА (а не ссылка): по клику Битрикс
+            # шлёт боту событие ONIMCOMMANDADD с ID нажавшего, без браузера и
+            # BX24. Это надёжно и даёт проверить, что отменяет именно заявитель.
+            # Команда регистрируется через /register-cancel-command.
             keyboard = [{
                 "TEXT": "❌ Отменить заявку",
-                "LINK": f"{APP_PUBLIC_URL}/pay/cancel?rid={rid}",
+                "COMMAND": CANCEL_COMMAND,
+                "COMMAND_PARAMS": rid,
                 "BG_COLOR": "#eb5757",
                 "TEXT_COLOR": "#ffffff",
                 "DISPLAY": "LINE",
@@ -2327,66 +2380,122 @@ def payment_cancel_route():
     )
 
 
+def _do_cancel_payment(rid, user_id):
+    """Общая логика отмены заявки. Возвращает (ok: bool, message: str).
+
+    Отменить может ТОЛЬКО заявитель (user_id == requester_id из таблицы).
+    Используется и веб-страницей `/pay/cancel/confirm`, и обработчиком
+    кнопки-команды в чате (ONIMCOMMANDADD).
+    """
+    rid = (rid or "").strip()
+    user_id = str(user_id or "").strip()
+    if not rid:
+        return False, "Не указан ID заявки"
+
+    row_number, values = find_payment_row_by_rid(rid)
+    if not row_number:
+        return False, "Заявка не найдена"
+
+    status        = (values[11] if len(values) > 11 else "").strip()
+    requester_id  = (values[13] if len(values) > 13 else "").strip()
+    message_id    = (values[14] if len(values) > 14 else "").strip()
+    requester_nm  = (values[1] if len(values) > 1 else "").strip()
+    amount        = (values[3] if len(values) > 3 else "").strip()
+    recipient     = (values[4] if len(values) > 4 else "").strip()
+    category      = (values[2] if len(values) > 2 else "").strip()
+
+    if status == "Отменена":
+        return False, "Заявка уже отменена"
+
+    # Отменить может только автор заявки.
+    if not user_id or user_id != str(requester_id):
+        return False, f"Отменить может только заявитель ({requester_nm})"
+
+    set_payment_status(row_number, "Отменена")
+
+    # Правим исходное сообщение в чате — помечаем отменённым и убираем кнопку.
+    if message_id:
+        cancelled = "\n".join([
+            "❌ [B]ЗАЯВКА ОТМЕНЕНА[/B]",
+            f"👤 Заявитель: {requester_nm}",
+            f"💰 Сумма: {amount}",
+            f"📂 Категория: {category}",
+            f"🏦 Получатель: {recipient}",
+            "",
+            "[I]Отменена заявителем[/I]",
+        ])
+        update_bot_message(message_id, cancelled)
+
+    # Отдельное уведомление в чат «Платежи» об отмене.
+    if PAYMENT_CHAT_ID:
+        send_message(PAYMENT_CHAT_ID, "\n".join([
+            "❌ [B]Заявка отменена[/B]",
+            f"👤 Заявитель: {requester_nm}",
+            f"💰 Сумма: {amount}",
+            f"🏦 Получатель: {recipient}",
+            f"📂 Категория: {category}",
+        ]))
+
+    return True, "Заявка помечена как отменённая"
+
+
 @app.route("/pay/cancel/confirm", methods=["POST"])
 def payment_cancel_confirm_route():
     """Выполняет отмену заявки: проверяет автора, ставит статус, правит сообщение."""
     try:
         rid = (request.form.get("rid") or "").strip()
         user_id = (request.form.get("user_id") or "").strip()
-        if not rid:
-            return jsonify({"ok": False, "message": "Не указан ID заявки"})
-
-        row_number, values = find_payment_row_by_rid(rid)
-        if not row_number:
-            return jsonify({"ok": False, "message": "Заявка не найдена"})
-
-        status        = (values[11] if len(values) > 11 else "").strip()
-        requester_id  = (values[13] if len(values) > 13 else "").strip()
-        message_id    = (values[14] if len(values) > 14 else "").strip()
-        requester_nm  = (values[1] if len(values) > 1 else "").strip()
-        amount        = (values[3] if len(values) > 3 else "").strip()
-        recipient     = (values[4] if len(values) > 4 else "").strip()
-        category      = (values[2] if len(values) > 2 else "").strip()
-
-        if status == "Отменена":
-            return jsonify({"ok": False, "message": "Заявка уже отменена"})
-
-        # Отменить может только автор заявки.
-        if not user_id or str(user_id) != str(requester_id):
-            return jsonify({
-                "ok": False,
-                "message": f"Отменить может только заявитель ({requester_nm})",
-            })
-
-        set_payment_status(row_number, "Отменена")
-
-        # Правим сообщение в чате — помечаем отменённым и убираем кнопку.
-        if message_id:
-            cancelled = "\n".join([
-                "❌ [B]ЗАЯВКА ОТМЕНЕНА[/B]",
-                f"👤 Заявитель: {requester_nm}",
-                f"💰 Сумма: {amount}",
-                f"📂 Категория: {category}",
-                f"🏦 Получатель: {recipient}",
-                "",
-                "[I]Отменена заявителем[/I]",
-            ])
-            update_bot_message(message_id, cancelled)
-
-        # Отдельное уведомление в чат «Платежи» об отмене.
-        if PAYMENT_CHAT_ID:
-            send_message(PAYMENT_CHAT_ID, "\n".join([
-                "❌ [B]Заявка отменена[/B]",
-                f"👤 Заявитель: {requester_nm}",
-                f"💰 Сумма: {amount}",
-                f"🏦 Получатель: {recipient}",
-                f"📂 Категория: {category}",
-            ]))
-
-        return jsonify({"ok": True, "message": "Заявка помечена как отменённая"})
+        ok, message = _do_cancel_payment(rid, user_id)
+        return jsonify({"ok": ok, "message": message})
     except Exception as e:
         print(f"payment_cancel_confirm_route error: {e}")
         return jsonify({"ok": False, "message": "Внутренняя ошибка"})
+
+
+def register_cancel_command():
+    """Регистрирует бот-команду «Отменить заявку» через входящий вебхук.
+
+    Делается один раз (дёрнуть /register-cancel-command). После этого кнопка
+    COMMAND в уведомлении начнёт присылать боту ONIMCOMMANDADD на /bot.
+    Требует BITRIX_BOT_ID (BOT_ID нашего чат-бота).
+    """
+    if not BITRIX_BOT_ID:
+        return False, "Не задан BITRIX_BOT_ID"
+    payload = {
+        "BOT_ID": BITRIX_BOT_ID,
+        "CLIENT_ID": BOT_CLIENT_ID,
+        "COMMAND": CANCEL_COMMAND,
+        "COMMON": "N",
+        "HIDDEN": "Y",
+        "EXTRANET": "N",
+        "EVENT_COMMAND_ADD": f"{APP_PUBLIC_URL}/bot",
+        "LANG": [{"LANGUAGE_ID": "ru", "TITLE": "Отмена заявки на оплату"}],
+    }
+    try:
+        resp = bitrix_post("imbot.command.register", payload, timeout=20)
+        body = resp.json()
+    except Exception as e:
+        return False, f"Ошибка запроса: {e}"
+    if body.get("error"):
+        # Команда уже зарегистрирована — это не ошибка для нас.
+        desc = body.get("error_description") or body.get("error")
+        if "exists" in str(desc).lower() or "already" in str(desc).lower():
+            return True, f"Команда уже зарегистрирована: {desc}"
+        return False, f"{desc}"
+    return True, f"Команда «{CANCEL_COMMAND}» зарегистрирована (result={body.get('result')})"
+
+
+@app.route("/register-cancel-command", methods=["GET"])
+def register_cancel_command_route():
+    ok, message = register_cancel_command()
+    icon = "✅" if ok else "❌"
+    return Response(
+        f"<!DOCTYPE html><html lang='ru'><head><meta charset='utf-8'></head>"
+        f"<body style='font-family:system-ui,sans-serif;padding:32px;'>"
+        f"<h2>{icon} Регистрация кнопки отмены</h2><p>{message}</p></body></html>",
+        mimetype="text/html; charset=utf-8",
+        status=200 if ok else 500,
+    )
 
 
 @app.route("/categories", methods=["GET"])
