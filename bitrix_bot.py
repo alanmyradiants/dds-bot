@@ -56,6 +56,14 @@ PAYMENT_PAYER_NAMES = [
     if n.strip()
 ]
 
+# Кто, КРОМЕ заявителя, может отменить любую заявку (по подстроке в ФИО).
+# По умолчанию — Анастасия Фаткуллина (ответственная за платежи).
+PAYMENT_CANCEL_EXTRA_NAMES = [
+    n.strip()
+    for n in os.getenv("PAYMENT_CANCEL_EXTRA_NAMES", "Фаткуллина").split(",")
+    if n.strip()
+]
+
 # ─────────────────────────────────────────────
 # Google Sheets credentials
 # ─────────────────────────────────────────────
@@ -2407,11 +2415,23 @@ def _do_cancel_payment(rid, user_id):
     if status == "Отменена":
         return False, "Заявка уже отменена"
 
-    # Отменить может только автор заявки.
-    if not user_id or user_id != str(requester_id):
-        return False, f"Отменить может только заявитель ({requester_nm})"
+    # Отменить может автор заявки ИЛИ один из PAYMENT_CANCEL_EXTRA_NAMES
+    # (по умолчанию — Анастасия Фаткуллина).
+    is_requester = bool(user_id) and user_id == str(requester_id)
+    canceller_name = requester_nm if is_requester else ""
+    allowed = is_requester
+    if not allowed and user_id:
+        canceller_name = resolve_user_name(user_id)
+        low = canceller_name.lower()
+        if any(sub.lower() in low for sub in PAYMENT_CANCEL_EXTRA_NAMES):
+            allowed = True
+    if not allowed:
+        extra = " или ".join(PAYMENT_CANCEL_EXTRA_NAMES) or "ответственный"
+        return False, f"Отменить может только заявитель ({requester_nm}) или {extra}"
 
     set_payment_status(row_number, "Отменена")
+
+    by_whom = "заявителем" if is_requester else canceller_name
 
     # Правим исходное сообщение в чате — помечаем отменённым и убираем кнопку.
     if message_id:
@@ -2422,7 +2442,7 @@ def _do_cancel_payment(rid, user_id):
             f"📂 Категория: {category}",
             f"🏦 Получатель: {recipient}",
             "",
-            "[I]Отменена заявителем[/I]",
+            f"[I]Отменена: {by_whom}[/I]",
         ])
         update_bot_message(message_id, cancelled)
 
@@ -2434,6 +2454,7 @@ def _do_cancel_payment(rid, user_id):
             f"💰 Сумма: {amount}",
             f"🏦 Получатель: {recipient}",
             f"📂 Категория: {category}",
+            f"[I]Отменил(а): {by_whom}[/I]",
         ]))
 
     return True, "Заявка помечена как отменённая"
