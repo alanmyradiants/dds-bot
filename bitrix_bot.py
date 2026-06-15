@@ -463,6 +463,17 @@ def derive_client_endpoint(fallback_url=None):
     return ""
 
 
+def bitrix_portal_url():
+    """Базовый URL портала Битрикс (напр. https://joto.bitrix24.ru) из вебхука."""
+    for url in (BITRIX_WEBHOOK_URL, BITRIX_DISK_WEBHOOK_URL):
+        if not url:
+            continue
+        p = urlparse(url)
+        if p.scheme and p.netloc:
+            return f"{p.scheme}://{p.netloc}"
+    return ""
+
+
 def apply_rules(counterparty, description, amount, t_type):
     """Применяет правила категоризации."""
     text = f"{counterparty} {description}".upper()
@@ -1838,7 +1849,12 @@ def upload_invoice_to_disk(filename, content_bytes):
             print(f"upload_invoice_to_disk status={up.status_code} body={safe_preview(up.text,300)}")
             return ""
         f = up.json().get("result") or {}
-        return f.get("DETAIL_URL") or f.get("DOWNLOAD_URL") or ""
+        link = (f.get("DETAIL_URL") or f.get("DOWNLOAD_URL") or "").strip()
+        # DETAIL_URL у диска часто относительный ("/company/personal/...") —
+        # делаем абсолютным, иначе превью в чате видит «несуществующий домен».
+        if link.startswith("/"):
+            link = bitrix_portal_url() + link
+        return link
     except Exception as e:
         print(f"upload_invoice_to_disk error: {e}")
         return ""
@@ -2210,7 +2226,9 @@ def payment_submit_route():
                 f"📅 Срок оплаты: {due_date or '—'}",
             ]
             if file_link:
-                lines.append(f"📎 Счёт: {file_link}")
+                # Оборачиваем в [url] — иначе Битрикс строит превью-карточку
+                # ссылки (и показывает 404, когда не может её развернуть).
+                lines.append(f"📎 [url={file_link}]Открыть счёт[/url]")
             lines.append("")
             lines.append(f"[USER={payer_id}]{payer_name}[/USER], нужно оплатить 🙏")
             # Кнопка отмены: открывает страницу /pay/cancel, где заявитель
