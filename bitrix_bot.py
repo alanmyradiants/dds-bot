@@ -1885,11 +1885,35 @@ def delete_payment_category(name):
         print(f"delete_payment_category error: {e}")
 
 
+def _pick_disk_storage(storages):
+    """Выбирает хранилище для загрузки счёта.
+
+    Приоритет — ОБЩИЙ диск компании (ENTITY_TYPE == "common"): он виден всем
+    сотрудникам, поэтому бухгалтер/плательщик сможет открыть файл. Личный диск
+    (ENTITY_TYPE == "user") — приватный, файл в нём даёт «Доступ запрещён»
+    любому, кроме владельца вебхука. Фолбэк — первое доступное хранилище.
+    """
+    def etype(s):
+        return str(s.get("ENTITY_TYPE") or "").lower()
+
+    for s in storages:
+        if etype(s) == "common":
+            return s
+    # Хоть что-то, но не личный диск, если есть выбор.
+    for s in storages:
+        if etype(s) != "user":
+            return s
+    return storages[0]
+
+
 def upload_invoice_to_disk(filename, content_bytes):
     """Загружает файл счёта на Bitrix-диск, возвращает ссылку для просмотра.
 
-    Использует первое доступное хранилище (disk.storage.getlist) и
-    кладёт файл в его корень через disk.storage.uploadfile.
+    Кладёт файл в ОБЩИЙ диск компании (см. `_pick_disk_storage`), чтобы его мог
+    открыть любой сотрудник (плательщик/бухгалтер), а не только владелец вебхука.
+    Дополнительно пытается получить публичную внешнюю ссылку
+    (`disk.file.getExternalLink`) — она открывается вообще без проверки прав,
+    поэтому используется как самая надёжная. Фолбэк — абсолютный DETAIL_URL.
     При любой ошибке возвращает "" — заявка всё равно создастся.
     """
     if not content_bytes:
@@ -1900,7 +1924,10 @@ def upload_invoice_to_disk(filename, content_bytes):
         if not storages:
             print("upload_invoice_to_disk: нет доступных хранилищ диска")
             return ""
-        storage_id = storages[0]["ID"]
+        storage = _pick_disk_storage(storages)
+        storage_id = storage["ID"]
+        print(f"upload_invoice_to_disk: хранилище ID={storage_id} "
+              f"ENTITY_TYPE={storage.get('ENTITY_TYPE')} NAME={storage.get('NAME')}")
 
         b64 = base64.b64encode(content_bytes).decode("ascii")
         up = bitrix_disk_post(
@@ -1917,6 +1944,15 @@ def upload_invoice_to_disk(filename, content_bytes):
             print(f"upload_invoice_to_disk status={up.status_code} body={safe_preview(up.text,300)}")
             return ""
         f = up.json().get("result") or {}
+        file_id = f.get("ID")
+
+        # Публичная внешняя ссылка — открывается без авторизации, поэтому
+        # надёжнее всего решает «Доступ запрещён». Работает, если в портале
+        # включены внешние ссылки на файлы диска; иначе — фолбэк на DETAIL_URL.
+        ext_link = _disk_external_link(file_id)
+        if ext_link:
+            return ext_link
+
         link = (f.get("DETAIL_URL") or f.get("DOWNLOAD_URL") or "").strip()
         # DETAIL_URL у диска часто относительный ("/company/personal/...") —
         # делаем абсолютным, иначе превью в чате видит «несуществующий домен».
@@ -1925,6 +1961,29 @@ def upload_invoice_to_disk(filename, content_bytes):
         return link
     except Exception as e:
         print(f"upload_invoice_to_disk error: {e}")
+        return ""
+
+
+def _disk_external_link(file_id):
+    """Публичная (без авторизации) ссылка на файл диска или "".
+
+    disk.file.getExternalLink возвращает URL, который открывается без входа в
+    портал — им может воспользоваться любой, у кого есть ссылка. Если фича
+    внешних ссылок в портале выключена, метод вернёт ошибку — тогда "".
+    """
+    if not file_id:
+        return ""
+    try:
+        resp = bitrix_disk_post("disk.file.getExternalLink", {"id": file_id})
+        if resp.status_code != 200:
+            print(f"_disk_external_link status={resp.status_code} body={safe_preview(resp.text,200)}")
+            return ""
+        link = (resp.json().get("result") or "").strip()
+        if link.startswith("/"):
+            link = bitrix_portal_url() + link
+        return link
+    except Exception as e:
+        print(f"_disk_external_link error: {e}")
         return ""
 
 
