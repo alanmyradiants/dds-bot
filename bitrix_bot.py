@@ -1064,6 +1064,10 @@ def try_download(url, extra_headers=None, connect_timeout=10, read_timeout=30):
             allow_redirects=True, stream=True,
         ) as resp:
             content_type = (resp.headers.get("Content-Type") or "").lower()
+            # Если был редирект — покажем, куда в итоге ушли (без query/токена).
+            if resp.history:
+                hops = " → ".join(str(r.url).split("?")[0] for r in resp.history)
+                print(f"try_download redirected: {hops} → {str(resp.url).split('?')[0]}")
             if resp.status_code != 200:
                 print(f"try_download status={resp.status_code} ct={content_type}")
                 return None
@@ -1174,6 +1178,9 @@ def get_pdf_bytes(file_id, fallback_url=None, auth=None):
             if not dl:
                 print(f"[{label}] no download_url in result")
                 return None
+            # Логируем адрес скачивания БЕЗ query (там токен) — чтобы видеть,
+            # на какой хост/путь уходит закачка (вдруг редирект на CDN).
+            print(f"[{label}] download_url host/path: {str(dl).split('?')[0]}")
             print(f"[{label}] downloading immediately...")
             return try_download(dl)
         except Exception as e:
