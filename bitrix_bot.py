@@ -1049,23 +1049,47 @@ def extract_download_url(file_info):
     return None
 
 
-def try_download(url, extra_headers=None):
+def try_download(url, extra_headers=None, connect_timeout=10, read_timeout=30):
+    """Качает файл по ссылке. stream=True + короткий read-timeout: если сервер
+    «держит» соединение и не отдаёт тело (именно так виснет скачивание файлов
+    Bitrix, к которым у вебхука нет доступа) — падаем за секунды, а не за 2
+    минуты. Раньше timeout=120 давал до 12 минут висения на всех попытках.
+    """
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/pdf,*/*"}
     if extra_headers:
         headers.update(extra_headers)
-    # Увеличен таймаут с 60 до 120 секунд
-    resp = requests.get(url, headers=headers, timeout=120, allow_redirects=True)
-    content_type = (resp.headers.get("Content-Type") or "").lower()
-    content_len = len(resp.content)
-    print(f"try_download status={resp.status_code} ct={content_type} size={content_len}")
-    if resp.status_code != 200:
+    try:
+        with requests.get(
+            url, headers=headers, timeout=(connect_timeout, read_timeout),
+            allow_redirects=True, stream=True,
+        ) as resp:
+            content_type = (resp.headers.get("Content-Type") or "").lower()
+            if resp.status_code != 200:
+                print(f"try_download status={resp.status_code} ct={content_type}")
+                return None
+            # Тянем тело кусками — read-timeout срабатывает между чанками,
+            # поэтому «немой» сервер отваливается быстро.
+            chunks, total = [], 0
+            for chunk in resp.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > 25 * 1024 * 1024:  # предохранитель 25 МБ
+                    break
+            content = b"".join(chunks)
+    except Exception as e:
+        print(f"try_download error: {e}")
         return None
-    if "text/html" in content_type:
+    print(f"try_download status=200 ct={content_type} size={len(content)}")
+    # HTML = страница логина/ошибки Bitrix, а не файл (проверяем и по ct, и по телу).
+    head = content.lstrip()[:64].lower()
+    if "text/html" in content_type or head.startswith(b"<!doctype html") or head.startswith(b"<html"):
         return None
-    if "application/pdf" in content_type or "application/octet-stream" in content_type or resp.content.startswith(b"%PDF"):
-        return resp.content
-    if content_len > 1024:
-        return resp.content
+    if "application/pdf" in content_type or "application/octet-stream" in content_type or content.startswith(b"%PDF"):
+        return content
+    if len(content) > 1024:
+        return content
     return None
 
 
@@ -1186,18 +1210,20 @@ def get_pdf_bytes(file_id, fallback_url=None, auth=None):
     if result:
         return result
 
-    # Попытки 2-6: disk-вебхук (5 раз, каждый раз свежий URL, пауза между попытками)
-    for attempt in range(5):
-        print(f"disk webhook attempt {attempt + 1}/5")
+    # Попытки 2-3: disk-вебхук (каждый раз свежий URL, короткая пауза).
+    # Больше 2 попыток смысла нет: если сервер «немой» и не отдаёт тело, он
+    # такой на всех попытках — только тянем время. try_download теперь падает
+    # за ~30с, а не за 120с.
+    for attempt in range(2):
+        print(f"disk webhook attempt {attempt + 1}/2")
         result = fetch_via_endpoint(
             BITRIX_DISK_WEBHOOK_URL, {"id": file_id}, f"disk-{attempt+1}"
         )
         if result:
             return result
-        # Пауза перед следующей попыткой (кроме последней)
-        if attempt < 4:
-            print(f"Waiting 3s before next attempt...")
-            time.sleep(3)
+        if attempt < 1:
+            print("Waiting 2s before next attempt...")
+            time.sleep(2)
 
     # Fallback URL из payload
     if fallback_url:
@@ -1213,7 +1239,13 @@ def get_pdf_bytes(file_id, fallback_url=None, auth=None):
             if result:
                 return result
 
-    raise ValueError("Не удалось скачать PDF. Проверьте логи.")
+    raise ValueError(
+        "Не удалось скачать файл из Битрикса — сервер не отдаёт тело файла "
+        "(у бота нет доступа к нему на Диске). Чаще всего это происходит с "
+        "ПЕРЕСЛАННЫМИ файлами: пришлите выписку обычным вложением (📎) в этот "
+        "чат, а не через «переслать». Если и так не качается — нужно проверить "
+        "права disk-вебхука в Битриксе (см. логи Railway)."
+    )
 
 
 # ─────────────────────────────────────────────
