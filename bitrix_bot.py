@@ -1716,6 +1716,137 @@ def health():
     return jsonify({"status": "ok"})
 
 
+# ─────────────────────────────────────────────
+# Загрузка выписки через веб-форму (обход Bitrix-диска)
+# Bytes файла приходят прямо из браузера → не зависим от скачивания из Bitrix.
+# ─────────────────────────────────────────────
+
+_UPLOAD_RESULTS = []  # последние результаты обработки (для показа на странице)
+
+
+def _push_upload_result(status, text):
+    _UPLOAD_RESULTS.insert(0, {"status": status, "text": text})
+    del _UPLOAD_RESULTS[10:]  # держим последние 10
+
+
+def _process_uploaded_statement(pdf_bytes, uploader=""):
+    """Фоновая обработка выписки, загруженной через /upload. Не зависит от
+    скачивания файла из Bitrix — байты уже у нас. Результат кладём в
+    _UPLOAD_RESULTS, чтобы показать на странице после обновления."""
+    from datetime import timezone, timedelta
+    t = datetime.now(timezone(timedelta(hours=3))).strftime("%H:%M")
+    try:
+        problems = check_all_services()
+        if problems:
+            msg = "⚠️ Проблемы с сервисами: " + "; ".join(problems)
+            _push_upload_result("error", f"{t} — {msg}")
+            print("upload: " + msg)
+            return
+        account_owner, transactions = extract_transactions(pdf_bytes)
+        clarify_list, skipped = write_to_sheets(
+            transactions, uploader=uploader, account_owner=account_owner)
+        total_in = sum(float(x.get("amount", 0) or 0)
+                       for x in transactions if x.get("type") == "in")
+        total_out = sum(float(x.get("amount", 0) or 0)
+                        for x in transactions if x.get("type") == "out")
+        dup = f", дублей пропущено: {skipped}" if skipped else ""
+        _push_upload_result(
+            "ok",
+            f"{t} — ✅ Готово: {len(transactions)} транзакций{dup}. "
+            f"Владелец: {account_owner or '—'}. "
+            f"Поступления {total_in:,.0f} ₽ / списания {total_out:,.0f} ₽."
+        )
+        print(f"upload: готово, транзакций={len(transactions)} "
+              f"владелец={account_owner!r} дублей={skipped}")
+    except Exception as e:
+        _push_upload_result("error", f"{t} — ❌ Ошибка: {e}")
+        print(f"upload process ERROR: {e}")
+
+
+def _render_upload_page(banner=""):
+    rows = ""
+    for r in _UPLOAD_RESULTS:
+        bg = "#e8f5e9" if r["status"] == "ok" else "#fdecea"
+        rows += f'<div class="res" style="background:{bg}">{r["text"]}</div>'
+    if not rows:
+        rows = ('<div class="muted">Пока пусто. Загрузите выписку — '
+                'результат появится здесь.</div>')
+    banner_html = f'<div class="banner">{banner}</div>' if banner else ""
+    return f"""<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Загрузка выписки · ДДС</title>
+<style>
+*{{box-sizing:border-box}}body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+margin:0;background:#eef2f6;color:#1f2a37}}
+.card{{max-width:640px;margin:0 auto;background:#fff;min-height:100vh}}
+.head{{background:linear-gradient(135deg,#2fc6f6,#1f8ee0);color:#fff;padding:24px 20px}}
+.head h1{{margin:0 0 6px;font-size:22px}}.head p{{margin:0;opacity:.95;font-size:14px}}
+.body{{padding:20px}}
+label{{display:block;font-weight:600;font-size:14px;margin:14px 0 6px}}
+input[type=file],input[type=text]{{width:100%;padding:12px;border:1px solid #cfd8e3;
+border-radius:10px;font-size:15px;background:#fff}}
+button{{margin-top:18px;width:100%;padding:14px;border:0;border-radius:10px;
+background:#1f8ee0;color:#fff;font-size:16px;font-weight:600;cursor:pointer}}
+button:active{{background:#166fb0}}
+.sheet{{display:block;text-align:center;margin:16px 0 6px;color:#1f8ee0;
+text-decoration:none;font-weight:600}}
+h2{{font-size:15px;margin:22px 0 10px;color:#5b6b7b}}
+.res{{padding:10px 12px;border-radius:8px;font-size:14px;margin-bottom:8px;line-height:1.4}}
+.muted{{color:#8a97a6;font-size:14px}}
+.banner{{margin:16px 20px 0;padding:12px 14px;border-radius:10px;background:#e7f3ff;
+border:1px solid #b6ddff;font-size:14px;line-height:1.45}}
+</style></head>
+<body><div class="card">
+ <div class="head"><h1>📄 Загрузка выписки</h1>
+ <p>Выберите PDF-выписку Сбербанка — бот разнесёт транзакции в таблицу «Расходы Сбер».</p></div>
+ {banner_html}
+ <div class="body">
+  <form method="post" action="/upload/submit" enctype="multipart/form-data">
+   <label>Файл выписки (PDF)</label>
+   <input type="file" name="file" accept="application/pdf,.pdf" required>
+   <label>Кто загрузил (необязательно)</label>
+   <input type="text" name="uploader" placeholder="Имя">
+   <button type="submit">Загрузить и обработать</button>
+  </form>
+  <a class="sheet" href="{SHEET_URL}" target="_blank">🔗 Открыть таблицу «Расходы Сбер»</a>
+  <h2>Последние загрузки</h2>
+  {rows}
+ </div>
+</div></body></html>"""
+
+
+@app.route("/upload", methods=["GET"])
+def upload_page():
+    return Response(_render_upload_page(), mimetype="text/html; charset=utf-8")
+
+
+@app.route("/upload/submit", methods=["POST"])
+def upload_submit():
+    f = request.files.get("file")
+    if not f or not (f.filename or "").lower().endswith(".pdf"):
+        return Response(
+            _render_upload_page(banner="❌ Нужен PDF-файл выписки."),
+            mimetype="text/html; charset=utf-8")
+    pdf_bytes = f.read()
+    if not pdf_bytes:
+        return Response(
+            _render_upload_page(banner="❌ Файл пустой, попробуйте ещё раз."),
+            mimetype="text/html; charset=utf-8")
+    uploader = (request.form.get("uploader") or "").strip()
+    # Обрабатываем в фоне, чтобы не упереться в таймаут веб-сервера.
+    threading.Thread(
+        target=_process_uploaded_statement,
+        args=(pdf_bytes, uploader),
+        daemon=True,
+    ).start()
+    return Response(
+        _render_upload_page(
+            banner="✅ Выписка принята, обрабатываю… Обновите страницу через "
+                   "30–60 секунд — результат появится в списке «Последние "
+                   "загрузки» ниже и в таблице."),
+        mimetype="text/html; charset=utf-8")
+
+
 @app.route("/help-text", methods=["GET"])
 def help_text_route():
     """Возвращает текущий HELP_TEXT для дебага/превью."""
