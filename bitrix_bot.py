@@ -147,6 +147,20 @@ PAYMENT_CATEGORIES_RETIRED = [
     "Транспортные расходы",
 ]
 
+
+def deployed_version():
+    """Какой коммит реально задеплоен (Railway подставляет эти env сам).
+
+    Без этого «задеплоилось или ещё собирается» приходится угадывать: сервер
+    отвечает 200 и на старой версии тоже.
+    """
+    sha = os.getenv("RAILWAY_GIT_COMMIT_SHA", "")
+    return {
+        "commit": sha[:7] if sha else "unknown",
+        "branch": os.getenv("RAILWAY_GIT_BRANCH", "unknown"),
+        "deployment_id": os.getenv("RAILWAY_DEPLOYMENT_ID", "unknown"),
+    }
+
 # Встроенные правила (дополняются из вкладки "Правила")
 BUILTIN_RULES = {
     # Фотосессия (Бизнес)
@@ -611,8 +625,18 @@ def init_sheets():
     ).execute().get("values", [])
     existing_cats = [r[0].strip() for r in existing if r and r[0].strip()]
 
-    kept = [c for c in existing_cats if c not in PAYMENT_CATEGORIES_RETIRED]
-    final_cats = kept + [c for c in PAYMENT_CATEGORIES_DEFAULT if c not in kept]
+    # Итоговый порядок: сначала стандартные — в порядке PAYMENT_CATEGORIES_DEFAULT,
+    # потом кастомные категории пользователя (в том порядке, в каком они в листе).
+    # Так новая категория встаёт на своё место в списке, а не в самый низ формы.
+    custom = []
+    for c in existing_cats:
+        if (c not in PAYMENT_CATEGORIES_RETIRED
+                and c not in PAYMENT_CATEGORIES_DEFAULT
+                and c not in custom):
+            custom.append(c)
+    final_cats = list(PAYMENT_CATEGORIES_DEFAULT) + custom
+    added = [c for c in final_cats if c not in existing_cats]
+    removed = [c for c in existing_cats if c not in final_cats]
     if final_cats != existing_cats:
         # Порядок и состав изменились — переписываем столбец целиком.
         service.spreadsheets().values().clear(
@@ -625,8 +649,6 @@ def init_sheets():
                 valueInputOption="RAW",
                 body={"values": [[c] for c in final_cats]},
             ).execute()
-        added = [c for c in final_cats if c not in existing_cats]
-        removed = [c for c in existing_cats if c not in final_cats]
         if added:
             print(f"ℹ️ Дописаны недостающие категории: {', '.join(added)}")
         if removed:
@@ -634,6 +656,16 @@ def init_sheets():
 
     print("✅ Таблица инициализирована")
     print("ℹ️ Правила заполнятся автоматически при загрузке PDF")
+
+    # Возвращаем ИТОГ, а не просто «ок»: по ответу /init-sheets сразу видно,
+    # применилась ли миграция категорий. Раньше ответ был одинаковый и когда
+    # лист поменялся, и когда код на сервере ещё старый и делать нечего.
+    return {
+        "categories_added": added,
+        "categories_removed": removed,
+        "categories_total": len(final_cats),
+        "categories": final_cats,
+    }
 
 
 def get_existing_rules(service):
@@ -1917,10 +1949,29 @@ th{{background:#f4f6f8;}}code{{background:#eef2f4;padding:2px 6px;border-radius:
 @app.route("/init-sheets", methods=["GET"])
 def init_sheets_route():
     try:
-        init_sheets()
-        return jsonify({"ok": True, "message": "Таблица инициализирована"})
+        summary = init_sheets() or {}
+        return jsonify({
+            "ok": True,
+            "message": "Таблица инициализирована",
+            "version": deployed_version(),
+            **summary,
+        })
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
+        return jsonify({"ok": False, "error": str(e), "version": deployed_version()})
+
+
+@app.route("/version", methods=["GET"])
+def version_route():
+    """Какая версия кода реально крутится на сервере.
+
+    Нужен, чтобы не гадать «задеплоилось или нет»: если после пуша тут старый
+    SHA — Railway ещё собирает (или деплой упал), и дёргать /init-sheets рано.
+    """
+    return jsonify({
+        "version": deployed_version(),
+        "payment_categories_default": PAYMENT_CATEGORIES_DEFAULT,
+        "payment_categories_retired": PAYMENT_CATEGORIES_RETIRED,
+    })
 
 
 # ─────────────────────────────────────────────
