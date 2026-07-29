@@ -112,7 +112,8 @@ PAYMENT_CATEGORIES_DEFAULT = [
     "Займы",
     "Фотосессия",
     "Автоматизация",
-    "Логистика",
+    "Логистика, отправка от фулфилмента до склада ВБ",
+    "Логистика перемещения",
     "Выкуп товара",
     "Реклама у блогера",
     "Самовыкуп",
@@ -134,6 +135,15 @@ PAYMENT_CATEGORIES_DEFAULT = [
     "Услуги пошива",
     "Изготовление бирок",
     "Коробки",
+]
+
+# Категории, выведенные из оборота. `init_sheets` удаляет их из листа
+# «Категории заявок» — иначе старое название висело бы в форме вечно, ведь
+# недостающие категории только дописываются, а лишние никогда не убирались.
+# Уже созданные заявки со старой категорией не трогаем — это история.
+PAYMENT_CATEGORIES_RETIRED = [
+    # Разделена на «…отправка от фулфилмента до склада ВБ» и «…перемещения».
+    "Логистика",
 ]
 
 # Встроенные правила (дополняются из вкладки "Правила")
@@ -587,7 +597,8 @@ def init_sheets():
     # Заголовок ставим всегда. Стандартные категории из PAYMENT_CATEGORIES_DEFAULT
     # дописываем недеструктивно: добавляем только те, которых ещё нет в листе, —
     # так новые категории появляются после /init-sheets, а правки пользователя
-    # (свои категории) не затираются.
+    # (свои категории) не затираются. Отдельно вычищаем PAYMENT_CATEGORIES_RETIRED —
+    # категории, которые переименовали/разделили.
     service.spreadsheets().values().update(
         spreadsheetId=SHEET_ID,
         range="Категории заявок!A1",
@@ -598,16 +609,27 @@ def init_sheets():
         spreadsheetId=SHEET_ID, range="Категории заявок!A2:A"
     ).execute().get("values", [])
     existing_cats = [r[0].strip() for r in existing if r and r[0].strip()]
-    missing = [c for c in PAYMENT_CATEGORIES_DEFAULT if c not in existing_cats]
-    if missing:
-        service.spreadsheets().values().append(
-            spreadsheetId=SHEET_ID,
-            range="Категории заявок!A:A",
-            valueInputOption="RAW",
-            insertDataOption="INSERT_ROWS",
-            body={"values": [[c] for c in missing]},
+
+    kept = [c for c in existing_cats if c not in PAYMENT_CATEGORIES_RETIRED]
+    final_cats = kept + [c for c in PAYMENT_CATEGORIES_DEFAULT if c not in kept]
+    if final_cats != existing_cats:
+        # Порядок и состав изменились — переписываем столбец целиком.
+        service.spreadsheets().values().clear(
+            spreadsheetId=SHEET_ID, range="Категории заявок!A2:A",
         ).execute()
-        print(f"ℹ️ Дописаны недостающие категории: {', '.join(missing)}")
+        if final_cats:
+            service.spreadsheets().values().update(
+                spreadsheetId=SHEET_ID,
+                range="Категории заявок!A2",
+                valueInputOption="RAW",
+                body={"values": [[c] for c in final_cats]},
+            ).execute()
+        added = [c for c in final_cats if c not in existing_cats]
+        removed = [c for c in existing_cats if c not in final_cats]
+        if added:
+            print(f"ℹ️ Дописаны недостающие категории: {', '.join(added)}")
+        if removed:
+            print(f"ℹ️ Удалены устаревшие категории: {', '.join(removed)}")
 
     print("✅ Таблица инициализирована")
     print("ℹ️ Правила заполнятся автоматически при загрузке PDF")
