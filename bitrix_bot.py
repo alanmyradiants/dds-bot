@@ -148,6 +148,16 @@ PAYMENT_CATEGORIES_RETIRED = [
 ]
 
 
+# Страницы, которые читают живые данные из Google Sheets (форма заявки, список
+# категорий), нельзя кешировать: мобильный Битрикс держит iframe в кеше и после
+# правки категорий показывает старый список — выглядит как «ничего не применилось».
+NO_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+
+
 def deployed_version():
     """Какой коммит реально задеплоен (Railway подставляет эти env сам).
 
@@ -2510,6 +2520,7 @@ def _render_payment_form(users, categories, error=None):
 </script>
 </body></html>""",
         mimetype="text/html; charset=utf-8",
+        headers=NO_CACHE_HEADERS,
     )
 
 
@@ -2889,7 +2900,8 @@ def categories_route():
     </form>
   </div>
 </div></body></html>"""
-    return Response(html, mimetype="text/html; charset=utf-8")
+    return Response(html, mimetype="text/html; charset=utf-8",
+                    headers=NO_CACHE_HEADERS)
 
 
 @app.route("/categories/add", methods=["POST"])
