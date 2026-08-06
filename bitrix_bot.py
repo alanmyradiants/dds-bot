@@ -67,7 +67,24 @@ PAYMENT_CANCEL_EXTRA_NAMES = [
 # ─────────────────────────────────────────────
 # Google Sheets credentials
 # ─────────────────────────────────────────────
-GOOGLE_CREDS_JSON = json.loads(os.environ.get('GOOGLE_CREDENTIALS'))
+# ВАЖНО: разбираем креды «мягко». Раньше здесь был json.loads(os.environ[...])
+# прямо на импорте — если переменная не задана или в ней битый JSON, падал ВЕСЬ
+# модуль: не поднимался Flask, /health и /check тоже не отвечали. Снаружи это
+# выглядело как «бот полностью умер», хотя проблема была в одной env-переменной.
+# Теперь приложение стартует всегда, а про поломку креды сообщает /check.
+GOOGLE_CREDS_ERROR = ""
+try:
+    _raw_google_creds = os.environ.get("GOOGLE_CREDENTIALS") or ""
+    if not _raw_google_creds.strip():
+        GOOGLE_CREDS_JSON = None
+        GOOGLE_CREDS_ERROR = "переменная GOOGLE_CREDENTIALS не задана"
+    else:
+        GOOGLE_CREDS_JSON = json.loads(_raw_google_creds)
+except Exception as _e:
+    GOOGLE_CREDS_JSON = None
+    GOOGLE_CREDS_ERROR = f"GOOGLE_CREDENTIALS — битый JSON: {_e}"
+if GOOGLE_CREDS_ERROR:
+    print(f"⚠️ Google Sheets: {GOOGLE_CREDS_ERROR}")
 
 # ─────────────────────────────────────────────
 # Категории и правила
@@ -170,6 +187,60 @@ def deployed_version():
         "branch": os.getenv("RAILWAY_GIT_BRANCH", "unknown"),
         "deployment_id": os.getenv("RAILWAY_DEPLOYMENT_ID", "unknown"),
     }
+
+
+# ─────────────────────────────────────────────
+# Диагностика «бот молчит»
+# ─────────────────────────────────────────────
+# /check раньше проверял только «доступны ли сервисы». Но самый частый симптом —
+# бот вообще не отвечает в чате, а причина одна из двух:
+#   1) Битрикс НЕ ДОСТАВЛЯЕТ события на /bot (бот отписан/не зарегистрирован) —
+#      тогда мы вообще ничего не получали;
+#   2) события приходят, а imbot.message.add падает (бот удалён из портала,
+#      не тот BOT_ID/CLIENT_ID, истёк вебхук) — тогда ошибка видна в ответе.
+# Раньше оба случая выглядели снаружи одинаково: тишина. Теперь запоминаем
+# последнее входящее событие и последнюю отправку — /check показывает, на каком
+# из двух шагов рвётся цепочка.
+_DIAG = {
+    "started_at": datetime.now().isoformat(timespec="seconds"),
+    "events_total": 0,
+    "last_event": None,   # {at, event, dialog_id, has_pdf, from}
+    "sends_total": 0,
+    "send_errors": 0,
+    "last_send": None,    # {at, dialog_id, ok, error}
+}
+_DIAG_LOCK = threading.Lock()
+
+
+def _record_event(event, dialog_id, extra=None):
+    with _DIAG_LOCK:
+        _DIAG["events_total"] += 1
+        _DIAG["last_event"] = {
+            "at": datetime.now().isoformat(timespec="seconds"),
+            "event": event or "",
+            "dialog_id": str(dialog_id or ""),
+            **(extra or {}),
+        }
+
+
+def _annotate_last_event(extra):
+    """Дописывает детали к уже записанному событию, не увеличивая счётчик."""
+    with _DIAG_LOCK:
+        if isinstance(_DIAG.get("last_event"), dict):
+            _DIAG["last_event"].update(extra or {})
+
+
+def _record_send(dialog_id, ok, error=""):
+    with _DIAG_LOCK:
+        _DIAG["sends_total"] += 1
+        if not ok:
+            _DIAG["send_errors"] += 1
+        _DIAG["last_send"] = {
+            "at": datetime.now().isoformat(timespec="seconds"),
+            "dialog_id": str(dialog_id or ""),
+            "ok": bool(ok),
+            "error": str(error or "")[:300],
+        }
 
 # Встроенные правила (дополняются из вкладки "Правила")
 BUILTIN_RULES = {
@@ -553,6 +624,8 @@ def apply_rules(counterparty, description, amount, t_type):
 # ─────────────────────────────────────────────
 
 def get_sheets_service():
+    if GOOGLE_CREDS_JSON is None:
+        raise RuntimeError(GOOGLE_CREDS_ERROR or "нет кредов Google")
     creds = service_account.Credentials.from_service_account_info(
         GOOGLE_CREDS_JSON,
         scopes=["https://www.googleapis.com/auth/spreadsheets"],
@@ -1036,11 +1109,25 @@ def send_message(dialog_id, text, keyboard=None):
             payload["KEYBOARD"] = keyboard
         resp = bitrix_post("imbot.message.add", payload, timeout=15)
         try:
-            return resp.json().get("result")
+            body = resp.json()
         except Exception:
+            body = {}
+        # Битрикс отвечает 200 и с ошибкой в теле («ERROR_BOT_NOT_FOUND» и т.п.).
+        # Раньше мы это молча проглатывали: в логах был только
+        # «imbot.message.add POST status=200», а сообщение до чата не доходило —
+        # бот выглядел мёртвым без единого следа причины.
+        if resp.status_code != 200 or (isinstance(body, dict) and body.get("error")):
+            err = "HTTP {}".format(resp.status_code)
+            if isinstance(body, dict) and body.get("error"):
+                err = str(body.get("error_description") or body.get("error"))
+            print(f"send_message FAILED ({err}): {safe_preview(resp.text, 300)}")
+            _record_send(dialog_id, False, err)
             return None
+        _record_send(dialog_id, True)
+        return body.get("result") if isinstance(body, dict) else None
     except Exception as e:
         print(f"send_message error: {e}")
+        _record_send(dialog_id, False, str(e))
         return None
 
 
@@ -1620,7 +1707,19 @@ def find_recent_pdf_in_chat(dialog_id, access_token=None, limit=10):
 
 
 def handle_cancel_command(data):
-    """Обрабатывает клик по кнопке «Отменить заявку» (событие ONIMCOMMANDADD).
+    """Клик по кнопке «Отменить заявку» (ONIMCOMMANDADD) — в фоне.
+
+    Обёртка над `_process_cancel_command`: сам /bot отвечает Битриксу сразу,
+    а отмена (чтение/запись Sheets + сообщения в чат) идёт в отдельном потоке.
+    """
+    try:
+        _process_cancel_command(data)
+    except Exception as e:
+        print(f"[cancel-command] ERROR: {e}")
+
+
+def _process_cancel_command(data):
+    """Разбирает payload команды и выполняет отмену заявки.
 
     Битрикс присылает поля в bracket-notation, напр.:
       data[COMMAND][0][COMMAND]        = 'cancelpay'
@@ -1650,7 +1749,8 @@ def handle_cancel_command(data):
     print(f"[cancel-command] command={command!r} rid={rid!r} user_id={user_id!r}")
 
     if command and command != CANCEL_COMMAND:
-        return jsonify({"result": "ok", "skipped": "other_command"})
+        print("[cancel-command] другая команда — пропускаем")
+        return
 
     ok, message = _do_cancel_payment(rid, user_id)
     print(f"[cancel-command] result ok={ok} msg={message!r}")
@@ -1658,11 +1758,18 @@ def handle_cancel_command(data):
     # нажавшему, чтобы он понял, почему ничего не произошло.
     if not ok and user_id:
         send_message(user_id, f"⚠️ {message}")
-    return jsonify({"result": "ok", "cancelled": ok})
 
 
 @app.route("/bot", methods=["GET", "POST"])
 def bot_handler():
+    """Приём событий Битрикса. Отвечает СРАЗУ, работу делает в фоне.
+
+    Раньше вся обработка шла внутри запроса: поиск PDF по истории чата (до 15с),
+    user.get за ФИО (до 10с) и imbot.message.add (до 15с) — суммарно больше
+    таймаута gunicorn/Битрикса. Если воркер убивали по таймауту, ответа не было
+    вообще: Битрикс считал доставку неудачной, а в чате — тишина. Теперь
+    единственное, что делает запрос, — фиксирует событие и отдаёт 200.
+    """
     if request.method == "GET":
         return jsonify({"result": "ok"})
 
@@ -1673,18 +1780,41 @@ def bot_handler():
     event = data.get("event", "")
     print(f"EVENT: {event}")
 
-    # Клик по кнопке «Отменить заявку» → бот-команда ONIMCOMMANDADD.
-    if event == "ONIMCOMMANDADD":
-        return handle_cancel_command(data)
-
-    if event not in ("ONIMBOTMESSAGEADD", "ONIMJOINCHAT"):
-        return jsonify({"result": "ok", "skipped": True})
-
     dialog_id = (
         data.get("data[PARAMS][DIALOG_ID]")
         or data.get("data[PARAMS][TO_CHAT_ID]")
     )
+    # Фиксируем ЛЮБОЕ событие — по этой метке /check отличает «Битрикс молчит»
+    # от «Битрикс шлёт, а мы не можем ответить».
+    _record_event(event, dialog_id)
 
+    # Клик по кнопке «Отменить заявку» → бот-команда ONIMCOMMANDADD.
+    if event == "ONIMCOMMANDADD":
+        threading.Thread(
+            target=handle_cancel_command, args=(data,), daemon=True
+        ).start()
+        return jsonify({"result": "ok", "queued": "cancel_command"})
+
+    if event not in ("ONIMBOTMESSAGEADD", "ONIMJOINCHAT"):
+        return jsonify({"result": "ok", "skipped": True})
+
+    threading.Thread(
+        target=_handle_message_event, args=(data, dialog_id), daemon=True
+    ).start()
+    return jsonify({"result": "ok", "queued": event})
+
+
+def _handle_message_event(data, dialog_id):
+    """Разбор сообщения из чата: найти PDF (или ответить текстом). В фоне."""
+    try:
+        _handle_message_event_inner(data, dialog_id)
+    except Exception as e:
+        print(f"_handle_message_event ERROR: {e}")
+        # Не молчим: если разбор упал, пользователь должен это увидеть.
+        send_message(dialog_id, f"❌ Ошибка при разборе сообщения: {e}")
+
+
+def _handle_message_event_inner(data, dialog_id):
     # В чате «Платежи» бот не болтает: на текст/чеки/платёжки молчит. Но если
     # туда прислали именно банковскую выписку — обрабатываем её как обычно.
     # Тип PDF (выписка или нет) определяется в process_pdf_async через ИИ.
@@ -1725,6 +1855,7 @@ def bot_handler():
                 fallback_url = recent_pdf["url_download"]
 
     if filename.lower().endswith(".pdf") and file_id:
+        _annotate_last_event({"pdf": filename, "file_id": str(file_id)})
         uploader = extract_uploader_name(data)
         # Достаём auth-токен пользователя из события — нужен для скачивания
         # файлов, загруженных НЕ владельцем вебхука (см. get_pdf_bytes).
@@ -1733,17 +1864,15 @@ def bot_handler():
         # ли это (иначе на чек бот бы написал «Получил PDF…»).
         if not is_pay:
             send_message(dialog_id, "📄 Получил PDF, начинаю обработку...")
-        thread = threading.Thread(
-            target=process_pdf_async,
-            args=(dialog_id, file_id, fallback_url, uploader, auth),
-            kwargs={"require_statement_check": is_pay},
-            daemon=True,
+        process_pdf_async(
+            dialog_id, file_id, fallback_url, uploader, auth,
+            require_statement_check=is_pay,
         )
-        thread.start()
 
     elif is_pay:
         # В чате «Платежи» на текст/чеки/прочее без выписки — молчим.
-        return jsonify({"result": "ok", "skipped": "payment_chat_no_statement"})
+        print("Платежи: не выписка — молчим")
+        return
 
     elif is_help_query(message_text):
         # Полная инструкция: «инструкция / помощь / help / команды / что ты умеешь / возможности»
@@ -1762,18 +1891,112 @@ def bot_handler():
             "Напиши [B]инструкция[/B] чтобы узнать что я умею.",
         )
 
-    return jsonify({"result": "ok"})
+
+def check_bot_registration():
+    """Зарегистрирован ли наш бот в портале (imbot.bot.list).
+
+    Если бота в списке нет — Битриксу некуда слать события и нечем отвечать:
+    в чате будет полная тишина при живом сервере. Лечится /install-app.
+    """
+    info = {"ok": None, "expected_bot_id": BITRIX_BOT_ID or "(не задан)", "bots": []}
+    try:
+        resp = bitrix_post("imbot.bot.list", {}, timeout=15)
+        try:
+            body = resp.json()
+        except Exception:
+            body = {}
+        if resp.status_code != 200 or body.get("error"):
+            info["ok"] = False
+            info["error"] = str(body.get("error_description") or body.get("error")
+                                or f"HTTP {resp.status_code}")
+            return info
+        result = body.get("result") or {}
+        # Битрикс отдаёт либо dict {bot_id: {...}}, либо список.
+        items = result.items() if isinstance(result, dict) else enumerate(result)
+        ids = []
+        for key, bot in items:
+            bot = bot if isinstance(bot, dict) else {}
+            bot_id = str(bot.get("ID") or bot.get("id") or key)
+            ids.append(bot_id)
+            info["bots"].append({"id": bot_id, "code": bot.get("CODE") or bot.get("code") or ""})
+        info["ok"] = bool(BITRIX_BOT_ID) and str(BITRIX_BOT_ID) in ids
+        if not ids:
+            info["ok"] = False
+    except Exception as e:
+        info["ok"] = False
+        info["error"] = str(e)[:200]
+    return info
+
+
+def bot_delivery_report():
+    """Проверки, которые нужны именно при жалобе «бот молчит»."""
+    bot = check_bot_registration()
+    with _DIAG_LOCK:
+        diag = json.loads(json.dumps(_DIAG))  # снимок, чтобы не отдавать живой dict
+
+    problems = []
+    if bot.get("ok") is False:
+        if not BITRIX_BOT_ID:
+            problems.append("❌ Бот: не задан BITRIX_BOT_ID — боту нечем "
+                            "подписаться на чат и нечем отвечать")
+        elif bot.get("error"):
+            problems.append(f"❌ Бот: не удалось получить список ботов — {bot['error']}")
+        else:
+            problems.append(
+                f"❌ Бот: BITRIX_BOT_ID={BITRIX_BOT_ID} не найден в портале "
+                f"(есть: {[b['id'] for b in bot.get('bots', [])] or 'ни одного'}) "
+                f"→ прогнать /install-app"
+            )
+
+    if diag["events_total"] == 0:
+        problems.append(
+            f"⚠️ Битрикс не присылал ни одного события с момента старта сервера "
+            f"({diag['started_at']}). Если в чат за это время писали — Битрикс НЕ "
+            f"доставляет события на /bot: проверить регистрацию бота (/install-app)."
+        )
+    if diag.get("last_send") and not diag["last_send"].get("ok"):
+        problems.append(
+            f"❌ Последняя отправка сообщения ПРОВАЛИЛАСЬ "
+            f"({diag['last_send']['at']}): {diag['last_send']['error']}. "
+            f"События доходят, но бот не может ответить в чат."
+        )
+    if diag["send_errors"] and diag["send_errors"] == diag["sends_total"]:
+        problems.append("❌ Ни одна отправка в чат не прошла с момента старта сервера.")
+
+    return problems, {"bot": bot, "activity": diag}
 
 
 @app.route("/check", methods=["GET"])
 def check_services_route():
+    """Первый шаг при «бот не работает».
+
+    Показывает и доступность сервисов (Anthropic / Sheets / Bitrix), и то,
+    доходят ли события от Битрикса и уходят ли сообщения обратно в чат.
+    """
     try:
         problems = check_all_services()
+        delivery_problems, delivery = bot_delivery_report()
+        problems = problems + delivery_problems
+        payload = {
+            "ok": not problems,
+            "version": deployed_version(),
+            "env": {
+                "ANTHROPIC_API_KEY": bool(ANTHROPIC_API_KEY),
+                "GOOGLE_CREDENTIALS": GOOGLE_CREDS_JSON is not None,
+                "BITRIX_BOT_ID": BITRIX_BOT_ID or "",
+                "BOT_CLIENT_ID_set": bool(BOT_CLIENT_ID),
+                "PAYMENT_CHAT_ID": PAYMENT_CHAT_ID,
+            },
+            **delivery,
+        }
         if problems:
-            return jsonify({"ok": False, "problems": problems})
-        return jsonify({"ok": True, "message": "Все сервисы работают ✅"})
+            payload["problems"] = problems
+        else:
+            payload["message"] = "Все сервисы работают ✅"
+        return jsonify(payload), 200, NO_CACHE_HEADERS
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
+        return jsonify({"ok": False, "error": str(e),
+                        "version": deployed_version()}), 200, NO_CACHE_HEADERS
 
 
 @app.route("/health", methods=["GET"])
