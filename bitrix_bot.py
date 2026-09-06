@@ -208,6 +208,9 @@ _DIAG = {
     "sends_total": 0,
     "send_errors": 0,
     "last_send": None,    # {at, dialog_id, ok, error}
+    "downloads_total": 0,
+    "download_errors": 0,
+    "last_download": None,  # {at, file_id, ok, reason, steps}
 }
 _DIAG_LOCK = threading.Lock()
 
@@ -240,6 +243,26 @@ def _record_send(dialog_id, ok, error=""):
             "dialog_id": str(dialog_id or ""),
             "ok": bool(ok),
             "error": str(error or "")[:300],
+        }
+
+
+def _record_download(file_id, ok, trace):
+    """Запоминает последнюю попытку скачать файл из Битрикса.
+
+    До этого единственным местом, где было видно, ПОЧЕМУ файл не скачался,
+    были логи Railway — а до них у пользователя доступа нет. Теперь трасса
+    попыток видна в /check и целиком в /download-test.
+    """
+    with _DIAG_LOCK:
+        _DIAG["downloads_total"] += 1
+        if not ok:
+            _DIAG["download_errors"] += 1
+        _DIAG["last_download"] = {
+            "at": datetime.now().isoformat(timespec="seconds"),
+            "file_id": str(file_id or ""),
+            "ok": bool(ok),
+            "reason": "" if ok else trace.summary(),
+            "steps": trace.steps,
         }
 
 # Встроенные правила (дополняются из вкладки "Правила")
@@ -389,6 +412,11 @@ def build_help_text():
         "▪️ В отчёте: количество транзакций, сумма поступлений и списаний, ссылка на таблицу\n"
         "▪️ Если нашлись операции с категорией [B]❓ Уточнить[/B] — пришлю их "
         "отдельно списком, чтобы Алан их разметил вручную в листе «Правила»\n\n"
+        "📤 [B]Если файл не скачивается[/B]\n"
+        "Иногда Битрикс не отдаёт мне тело файла (чаще всего с пересланными "
+        "вложениями). Тогда загрузите выписку через страницу "
+        f"[url={APP_PUBLIC_URL}/upload]{APP_PUBLIC_URL}/upload[/url] — "
+        "она отправляет файл прямо в обработку, минуя Диск Битрикса.\n\n"
         "🧠 [B]Категоризация[/B]\n"
         "▪️ У меня встроен список правил для частых контрагентов "
         "(Пятёрочка → Супермаркеты, Yandex GO → Транспорт и т.д.)\n"
@@ -1193,6 +1221,93 @@ def find_pdf_in_payload(data):
     return result
 
 
+# ─────────────────────────────────────────────
+# Скачивание файла из Битрикса
+# ─────────────────────────────────────────────
+# Хроника проблемы (см. handoff 2026-07-24): disk.file.get отдаёт DOWNLOAD_URL
+# со статусом 200, но закачка САМОГО ТЕЛА с joto.bitrix24.ru виснет — портал
+# принимает соединение, отдаёт заголовки и не присылает байты. Снаружи это
+# неотличимо от «нет прав», поэтому месяц ушёл на догадки. Здесь два принципа:
+#   1) каждая попытка ПРОТОКОЛИРУЕТСЯ (шаг, статус, content-type, размер,
+#      время, ошибка). Трасса уходит в /check и /download-test — причину видно
+#      без логов Railway, до которых у пользователя нет доступа;
+#   2) общий БЮДЖЕТ времени: раньше шесть попыток по 120с давали 12 минут
+#      тишины в чате.
+
+DOWNLOAD_BUDGET_SEC = 100   # потолок на ВСЕ попытки скачать один файл
+REST_TIMEOUT_SEC    = 15    # метаданные REST отвечают за доли секунды
+
+
+def _url_label(url):
+    """URL без query: в query лежит auth-токен, ему не место в логах и трассе."""
+    return str(url or "").split("?")[0]
+
+
+def _with_auth_param(url, token):
+    """Добавляет ?auth=<token> к ссылке, если его там ещё нет."""
+    if not url or not token:
+        return url
+    if "auth=" in (urlparse(url).query or ""):
+        return url
+    return url + ("&" if urlparse(url).query else "?") + "auth=" + token
+
+
+# Два «профиля клиента». Bitrix-облако за WAF иногда молча тарпитит запросы с
+# браузерным User-Agent, приходящие с дата-центрового IP (Railway): заголовки
+# отдаёт, тело — нет. Мелкий JSON REST при этом проходит. Поэтому если тело
+# файла не доехало, вторая попытка идёт «честным» клиентом: без маскировки под
+# браузер, без сжатия и с Connection: close. Если дело не в WAF, вторая попытка
+# просто повторит первую — цена одна лишняя запись в трассе.
+_CLIENT_PROFILES = [
+    ("browser", {"User-Agent": "Mozilla/5.0",
+                 "Accept": "application/pdf,*/*"}),
+    ("plain",   {"User-Agent": "dds-bot/1.0 (python-requests)",
+                 "Accept": "*/*",
+                 "Accept-Encoding": "identity",
+                 "Connection": "close"}),
+]
+
+
+class DownloadTrace:
+    """Журнал попыток скачивания: что пробовали, чем кончилось, сколько заняло.
+
+    Нужен потому, что «файл не скачался» — это пять разных причин (нет прав,
+    портал молчит, вернулась HTML-страница логина, истёк токен, файла нет),
+    и снаружи они выглядят одинаково. `steps` уезжает в /download-test целиком,
+    `reasons` — короткая выжимка для сообщения в чат.
+    """
+
+    def __init__(self):
+        self.started = time.monotonic()
+        self.steps = []
+        self.reasons = []
+
+    def add(self, step, **fields):
+        entry = {"step": step, "t": round(time.monotonic() - self.started, 1)}
+        for key, value in fields.items():
+            if value not in (None, "", []):
+                entry[key] = value
+        self.steps.append(entry)
+        print(f"[download] {json.dumps(entry, ensure_ascii=False)}")
+        return entry
+
+    def reason(self, text):
+        """Короткая человекочитаемая причина (без дублей, в порядке появления)."""
+        if text and text not in self.reasons:
+            self.reasons.append(text)
+
+    def seconds_left(self):
+        return DOWNLOAD_BUDGET_SEC - (time.monotonic() - self.started)
+
+    def out_of_time(self):
+        # 5 секунд про запас: начинать попытку, на которую заведомо не хватит
+        # времени, — только путать трассу.
+        return self.seconds_left() <= 5
+
+    def summary(self):
+        return "; ".join(self.reasons[:4]) or "ни одна попытка не дала файла"
+
+
 def extract_download_url(file_info):
     for key in ["DOWNLOAD_URL", "downloadUrl", "DOWNLOAD_URL_MACHINE", "URL_DOWNLOAD"]:
         value = file_info.get(key)
@@ -1201,210 +1316,353 @@ def extract_download_url(file_info):
     return None
 
 
-def try_download(url, extra_headers=None, connect_timeout=10, read_timeout=30):
-    """Качает файл по ссылке. stream=True + короткий read-timeout: если сервер
-    «держит» соединение и не отдаёт тело (именно так виснет скачивание файлов
-    Bitrix, к которым у вебхука нет доступа) — падаем за секунды, а не за 2
-    минуты. Раньше timeout=120 давал до 12 минут висения на всех попытках.
+def try_download(url, extra_headers=None, connect_timeout=10, read_timeout=30,
+                 trace=None, label="download"):
+    """Качает файл по ссылке. Возвращает bytes или None.
+
+    stream=True + короткий read-timeout: тело читается кусками, поэтому «немой»
+    сервер отваливается за секунды, а не за две минуты. Если первая попытка
+    упала ИМЕННО по таймауту чтения — повторяем неброузерным профилем
+    (см. `_CLIENT_PROFILES`): возможно, тарпитит WAF, а не права.
     """
-    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/pdf,*/*"}
-    if extra_headers:
-        headers.update(extra_headers)
-    try:
-        with requests.get(
-            url, headers=headers, timeout=(connect_timeout, read_timeout),
-            allow_redirects=True, stream=True,
-        ) as resp:
+    trace = trace or DownloadTrace()
+    body_incomplete = False
+
+    for profile_name, base_headers in _CLIENT_PROFILES:
+        if profile_name != "browser" and not body_incomplete:
+            break  # второй профиль имеет смысл только после тарпита
+        if trace.out_of_time():
+            trace.add(f"{label}/{profile_name}", url=_url_label(url),
+                      error="бюджет времени исчерпан")
+            return None
+
+        headers = dict(base_headers)
+        if extra_headers:
+            headers.update(extra_headers)
+        info = {"url": _url_label(url), "profile": profile_name}
+
+        # Фаза 1: соединиться и получить заголовки.
+        try:
+            resp = requests.get(
+                url, headers=headers, timeout=(connect_timeout, read_timeout),
+                allow_redirects=True, stream=True,
+            )
+        except Exception as e:
+            info["error"] = f"{type(e).__name__}: {e}"
+            info["verdict"] = "не удалось соединиться"
+            trace.add(f"{label}/{profile_name}", **info)
+            trace.reason(f"портал недоступен ({type(e).__name__})")
+            return None
+
+        # Фаза 2: прочитать тело. Разделено с фазой 1 намеренно: «портал принял
+        # соединение, отдал заголовки и не прислал байты» — это ровно тот
+        # симптом, который ловим (см. handoff), и выглядеть он может по-разному:
+        # ReadTimeout, ChunkedEncodingError, ConnectionError, IncompleteRead.
+        # Все они означают одно и то же и лечатся одинаково — повтором другим
+        # профилем клиента.
+        with resp:
             content_type = (resp.headers.get("Content-Type") or "").lower()
-            # Если был редирект — покажем, куда в итоге ушли (без query/токена).
+            info["status"] = resp.status_code
+            info["ct"] = content_type
             if resp.history:
-                hops = " → ".join(str(r.url).split("?")[0] for r in resp.history)
-                print(f"try_download redirected: {hops} → {str(resp.url).split('?')[0]}")
+                hops = [_url_label(r.url) for r in resp.history]
+                info["redirects"] = " → ".join(hops + [_url_label(resp.url)])
             if resp.status_code != 200:
-                print(f"try_download status={resp.status_code} ct={content_type}")
+                info["verdict"] = "HTTP != 200"
+                trace.add(f"{label}/{profile_name}", **info)
+                trace.reason(f"портал ответил {resp.status_code}")
                 return None
-            # Тянем тело кусками — read-timeout срабатывает между чанками,
-            # поэтому «немой» сервер отваливается быстро.
-            chunks, total = [], 0
-            for chunk in resp.iter_content(chunk_size=65536):
-                if not chunk:
-                    continue
-                chunks.append(chunk)
-                total += len(chunk)
-                if total > 25 * 1024 * 1024:  # предохранитель 25 МБ
-                    break
-            content = b"".join(chunks)
-    except Exception as e:
-        print(f"try_download error: {e}")
+            try:
+                # Тело читаем кусками: read-timeout срабатывает между чанками,
+                # поэтому «немой» сервер отваливается за секунды, а не за две
+                # минуты.
+                chunks, total = [], 0
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if not chunk:
+                        continue
+                    chunks.append(chunk)
+                    total += len(chunk)
+                    if total > 25 * 1024 * 1024:  # предохранитель 25 МБ
+                        break
+                content = b"".join(chunks)
+            except Exception as e:
+                body_incomplete = True
+                info["error"] = f"{type(e).__name__}: {e}"
+                info["verdict"] = "заголовки пришли, тело файла — нет"
+                trace.add(f"{label}/{profile_name}", **info)
+                trace.reason("портал отдал заголовки, но не отдал тело файла")
+                continue
+
+        info["size"] = len(content)
+        head = content.lstrip()[:64].lower()
+        is_html = ("text/html" in content_type
+                   or head.startswith(b"<!doctype html") or head.startswith(b"<html"))
+        if is_html:
+            # Это осознанный ответ портала «ты не авторизован», а не сбой связи:
+            # менять профиль клиента бессмысленно, нужен другой способ доступа.
+            info["verdict"] = "вместо файла пришла HTML-страница (логин/ошибка)"
+            trace.add(f"{label}/{profile_name}", **info)
+            trace.reason("вместо файла пришла страница логина Битрикса")
+            return None
+
+        # Пустое (или подозрительно короткое) тело при 200 — тот же отказ, что и
+        # обрыв чтения: портал ответил, но файла не дал. Проверяем ДО разбора
+        # content-type, иначе пустой ответ с "Content-Type: application/pdf"
+        # уехал бы дальше как «успешно скачанный» ноль байт.
+        if len(content) < 512:
+            body_incomplete = True
+            info["verdict"] = "тело пустое или слишком короткое для файла"
+            trace.add(f"{label}/{profile_name}", **info)
+            trace.reason("портал ответил 200, но файла в ответе нет")
+            continue
+
+        if (content.startswith(b"%PDF")
+                or "application/pdf" in content_type
+                or "application/octet-stream" in content_type
+                or len(content) > 1024):
+            info["verdict"] = "ok"
+            trace.add(f"{label}/{profile_name}", **info)
+            return content
+
+        info["verdict"] = "ответ не похож на файл"
+        trace.add(f"{label}/{profile_name}", **info)
+        trace.reason("портал вернул не файл")
         return None
-    print(f"try_download status=200 ct={content_type} size={len(content)}")
-    # HTML = страница логина/ошибки Bitrix, а не файл (проверяем и по ct, и по телу).
-    head = content.lstrip()[:64].lower()
-    if "text/html" in content_type or head.startswith(b"<!doctype html") or head.startswith(b"<html"):
-        return None
-    if "application/pdf" in content_type or "application/octet-stream" in content_type or content.startswith(b"%PDF"):
-        return content
-    if len(content) > 1024:
-        return content
+
     return None
 
 
-def fetch_via_attached_object(endpoint, file_id, label, access_token=None):
-    """disk.attachedObject.get — для файлов, прикреплённых к чату.
+def _rest_get(endpoint, method, params, trace, label):
+    """GET к REST-методу Битрикса с записью результата в трассу.
 
-    В Битриксе у chat-attached файлов есть отдельный «attached object»,
-    к которому имеют доступ ВСЕ участники чата, даже если на сам файл
-    в Диске прав нет. Это спасает ситуацию, когда сотрудник присылает
-    PDF из своего личного Диска — обычный disk.file.get вернёт 403,
-    а disk.attachedObject.get может отдать ссылку на скачивание.
-
-    Bitrix принимает в качестве id как attached_object_id, так и
-    в некоторых конфигурациях file_id (он внутри ищет привязанный
-    объект). Пробуем file_id — если Bitrix умеет, найдёт сам.
+    Возвращает `result` метода или None. Отдельная функция, потому что все
+    способы достать файл начинаются одинаково: дёрнуть метод, посмотреть, не
+    вернул ли Битрикс 200 с `{"error": ...}` в теле (он так умеет).
     """
+    if trace.out_of_time():
+        trace.add(f"{label}/{method}", error="бюджет времени исчерпан")
+        return None
     try:
-        params = {"id": file_id}
-        if access_token:
-            params["auth"] = access_token
         resp = requests.get(
-            f"{endpoint.rstrip('/')}/disk.attachedObject.get.json",
-            params=params,
-            timeout=60,
+            f"{endpoint.rstrip('/')}/{method}.json",
+            params=params, timeout=REST_TIMEOUT_SEC,
         )
-        body_preview = safe_preview(resp.text, 300)
-        print(f"[{label}] disk.attachedObject.get status={resp.status_code} body={body_preview}")
-        if resp.status_code != 200:
-            return None
-        payload = resp.json()
-        if payload.get("error"):
-            return None
-        result_obj = payload.get("result") or {}
-        dl = extract_download_url(result_obj)
-        if not dl:
-            print(f"[{label}] no download_url in attachedObject result")
-            return None
-        print(f"[{label}] downloading via attachedObject...")
-        return try_download(dl)
     except Exception as e:
-        print(f"[{label}] attachedObject failed: {e}")
+        trace.add(f"{label}/{method}", error=f"{type(e).__name__}: {e}")
+        trace.reason(f"{method}: сеть недоступна")
         return None
 
+    entry = {"status": resp.status_code}
+    if resp.status_code != 200:
+        entry["body"] = safe_preview(resp.text, 200)
+        trace.add(f"{label}/{method}", **entry)
+        trace.reason(f"{method} → HTTP {resp.status_code}")
+        return None
+    try:
+        payload = resp.json()
+    except Exception:
+        entry["body"] = safe_preview(resp.text, 200)
+        trace.add(f"{label}/{method}", **entry, error="ответ не JSON")
+        return None
+    if payload.get("error"):
+        entry["error"] = str(payload.get("error"))
+        entry["error_description"] = safe_preview(payload.get("error_description"), 200)
+        trace.add(f"{label}/{method}", **entry)
+        trace.reason(f"{method} → {payload.get('error')}")
+        return None
+    result = payload.get("result")
+    if not result:
+        trace.add(f"{label}/{method}", **entry, verdict="пустой result")
+        return None
+    trace.add(f"{label}/{method}", **entry, verdict="ok")
+    return result
 
-def get_pdf_bytes(file_id, fallback_url=None, auth=None):
-    """Скачивает PDF — каждый раз получаем свежий URL и сразу качаем.
 
-    Стратегия (от самого надёжного к самому слабому):
-      0. Если в auth есть access_token + client_endpoint, ходим в REST
-         от имени пользователя, который отправил файл — у него точно
-         есть доступ к собственному файлу. Это решает проблему 403
-         для сотрудников, не являющихся владельцем вебхука.
-      1. Основной вебхук портала (legacy fallback).
-      2. Disk-вебхук, до 5 попыток с паузой (legacy fallback).
-      3. Прямой fallback_url из payload + Bearer-токен вебхука.
+def fetch_via_disk_file_get(endpoint, file_id, trace, label, access_token=None):
+    """disk.file.get → DOWNLOAD_URL → качаем.
+
+    В DOWNLOAD_URL Битрикс кладёт auth сам, но не всегда (зависит от того, чем
+    авторизован вызов), поэтому если auth в ссылке нет — подставляем свой.
     """
+    params = {"id": file_id}
+    if access_token:
+        params["auth"] = access_token
+    result = _rest_get(endpoint, "disk.file.get", params, trace, label)
+    if not result:
+        return None
+    dl = extract_download_url(result)
+    if not dl:
+        trace.add(f"{label}/disk.file.get", verdict="в ответе нет DOWNLOAD_URL")
+        trace.reason("в ответе Битрикса нет ссылки на скачивание")
+        return None
+    token = access_token or endpoint.rstrip("/").split("/")[-1]
+    return try_download(_with_auth_param(dl, token), trace=trace, label=f"{label}/body")
 
+
+def fetch_via_attached_object(endpoint, file_id, trace, label, access_token=None):
+    """disk.attachedObject.get — для файлов, прикреплённых к чату.
+
+    У chat-attached файлов есть отдельный «attached object», доступный ВСЕМ
+    участникам чата, даже если прав на сам файл в Диске нет. Битрикс в части
+    конфигураций принимает сюда и file_id (сам находит привязанный объект),
+    поэтому пробуем — если не найдёт, вернёт ERROR_NOT_FOUND и мы пойдём дальше.
+    """
+    params = {"id": file_id}
+    if access_token:
+        params["auth"] = access_token
+    result = _rest_get(endpoint, "disk.attachedObject.get", params, trace, label)
+    if not result:
+        return None
+    dl = extract_download_url(result)
+    if not dl:
+        trace.add(f"{label}/disk.attachedObject.get", verdict="нет DOWNLOAD_URL")
+        return None
+    token = access_token or endpoint.rstrip("/").split("/")[-1]
+    return try_download(_with_auth_param(dl, token), trace=trace, label=f"{label}/body")
+
+
+def fetch_via_external_link(endpoint, file_id, trace, label, access_token=None):
+    """disk.file.getExternalLink — ПУБЛИЧНАЯ ссылка, качается вообще без auth.
+
+    Последний способ в очереди, и намеренно: метод не просто читает файл, а
+    СОЗДАЁТ на него публичную ссылку в портале. Для банковской выписки это
+    лишняя (пусть и неугадываемая) точка доступа, поэтому идём сюда, только
+    когда все авторизованные способы уже провалились и альтернатива — совсем
+    не обработать выписку. Отключается env DISK_EXTERNAL_LINK_FALLBACK=0.
+    """
+    params = {"id": file_id}
+    if access_token:
+        params["auth"] = access_token
+    link = _rest_get(endpoint, "disk.file.getExternalLink", params, trace, label)
+    if not link or not isinstance(link, str):
+        return None
+    if link.startswith("/"):
+        link = bitrix_portal_url() + link
+    return try_download(link, trace=trace, label=f"{label}/body")
+
+
+def _download_pdf(file_id, fallback_url, auth, trace):
+    """Перебирает способы скачать PDF. Возвращает bytes или бросает ValueError.
+
+    Каждый способ = свежий URL + немедленная закачка (ссылки Битрикса
+    короткоживущие). Порядок — от самого «правильного» к самому отчаянному:
+
+      0. REST от имени пользователя, приславшего файл (у него точно есть права).
+      1. disk.attachedObject.get — доступ по факту участия в чате.
+      2. disk.file.get основным вебхуком.
+      3. disk.file.get disk-вебхуком (2 попытки).
+      4. Прямая ссылка из payload (auth в query, затем Bearer).
+      5. Публичная внешняя ссылка — крайняя мера, см. fetch_via_external_link.
+
+    Всё уложено в DOWNLOAD_BUDGET_SEC; трасса попыток пишется в `trace`.
+    """
+    trace = trace or DownloadTrace()
     auth = auth or {}
     user_token    = (auth.get("access_token") or "").strip()
     user_endpoint = (auth.get("client_endpoint") or "").strip()
     if user_token and not user_endpoint:
-        # На всякий случай — если событие пришло без client_endpoint,
-        # выводим его из основного вебхука (это всё ещё тот же портал).
+        # Событие пришло без client_endpoint — выводим его из вебхука
+        # (портал тот же самый).
         user_endpoint = derive_client_endpoint()
 
-    def fetch_via_endpoint(endpoint, params, label):
-        """Запрашивает disk.file.get у произвольного REST-эндпоинта,
-        достаёт DOWNLOAD_URL и сразу качает файл."""
-        try:
-            resp = requests.get(
-                f"{endpoint.rstrip('/')}/disk.file.get.json",
-                params=params,
-                timeout=60,
-            )
-            print(f"[{label}] disk.file.get status={resp.status_code}")
-            if resp.status_code != 200:
-                return None
-            payload = resp.json()
-            if not payload.get("result"):
-                return None
-            dl = extract_download_url(payload["result"])
-            if not dl:
-                print(f"[{label}] no download_url in result")
-                return None
-            # Логируем адрес скачивания БЕЗ query (там токен) — чтобы видеть,
-            # на какой хост/путь уходит закачка (вдруг редирект на CDN).
-            print(f"[{label}] download_url host/path: {str(dl).split('?')[0]}")
-            print(f"[{label}] downloading immediately...")
-            return try_download(dl)
-        except Exception as e:
-            print(f"[{label}] failed: {e}")
-            return None
+    trace.add("start", file_id=str(file_id or ""),
+              user_context=bool(user_token and user_endpoint),
+              has_fallback_url=bool(fallback_url))
 
-    # Попытка 0: контекст пользователя, отправившего файл (самое надёжное)
+    # 0. Контекст пользователя — самый надёжный способ, если токен прислали.
     if user_token and user_endpoint:
-        result = fetch_via_endpoint(
-            user_endpoint,
-            {"id": file_id, "auth": user_token},
-            "user-context",
-        )
+        result = fetch_via_disk_file_get(user_endpoint, file_id, trace,
+                                         "user", access_token=user_token)
         if result:
             return result
-        print("user-context failed, fallback to webhooks")
     else:
-        print("no user access_token in event, skipping user-context attempt")
+        trace.add("user", verdict="в событии нет access_token — пропускаем")
 
-    # Попытка 0.5: disk.attachedObject.get — для файлов в чатах.
-    # Это спасает кейс, когда не-владелец webhook'а (сотрудник) загружает
-    # PDF — disk.file.get вернёт 403, а attachedObject доступен участникам
-    # чата (бот == участник чата, поэтому может скачать).
-    print("[main] trying disk.attachedObject.get for chat-attached file")
-    result = fetch_via_attached_object(BITRIX_WEBHOOK_URL, file_id, "main-attached", access_token=user_token or None)
-    if result:
-        return result
-    result = fetch_via_attached_object(BITRIX_DISK_WEBHOOK_URL, file_id, "disk-attached")
-    if result:
-        return result
-
-    # Попытка 1: основной вебхук
-    result = fetch_via_endpoint(BITRIX_WEBHOOK_URL, {"id": file_id}, "main")
-    if result:
-        return result
-
-    # Попытки 2-3: disk-вебхук (каждый раз свежий URL, короткая пауза).
-    # Больше 2 попыток смысла нет: если сервер «немой» и не отдаёт тело, он
-    # такой на всех попытках — только тянем время. try_download теперь падает
-    # за ~30с, а не за 120с.
-    for attempt in range(2):
-        print(f"disk webhook attempt {attempt + 1}/2")
-        result = fetch_via_endpoint(
-            BITRIX_DISK_WEBHOOK_URL, {"id": file_id}, f"disk-{attempt+1}"
-        )
+    # 1. Attached object: спасает случай «сотрудник прислал файл из личного
+    #    Диска» — прав на файл нет, а на вложение в чате есть.
+    for endpoint, label, token in [
+        (BITRIX_WEBHOOK_URL, "main-attached", user_token or None),
+        (BITRIX_DISK_WEBHOOK_URL, "disk-attached", None),
+    ]:
+        result = fetch_via_attached_object(endpoint, file_id, trace, label,
+                                           access_token=token)
         if result:
             return result
-        if attempt < 1:
-            print("Waiting 2s before next attempt...")
+
+    # 2-3. Вебхуки портала. Больше двух попыток на disk-вебхук смысла не имеет:
+    #      если портал «немой», он немой на всех попытках.
+    result = fetch_via_disk_file_get(BITRIX_WEBHOOK_URL, file_id, trace, "main")
+    if result:
+        return result
+    for attempt in range(2):
+        if trace.out_of_time():
+            break
+        result = fetch_via_disk_file_get(
+            BITRIX_DISK_WEBHOOK_URL, file_id, trace, f"disk-{attempt + 1}")
+        if result:
+            return result
+        if attempt == 0:
             time.sleep(2)
 
-    # Fallback URL из payload
+    # 4. Прямая ссылка из payload. Сначала auth в query (работает для /rest/),
+    #    затем Bearer (иногда проходит для /bitrix/).
     if fallback_url:
-        # Если есть user access_token — пробуем им же
-        if user_token:
-            print("Trying fallback_url with user access_token (Bearer)")
-            result = try_download(fallback_url, {"Authorization": f"Bearer {user_token}"})
+        for label, token in [("user", user_token),
+                             ("main", BITRIX_WEBHOOK_URL.rstrip("/").split("/")[-1]),
+                             ("disk", DISK_TOKEN)]:
+            if not token:
+                continue
+            result = try_download(_with_auth_param(fallback_url, token),
+                                  trace=trace, label=f"payload-url/{label}")
             if result:
                 return result
-        for label, token in [("main", BITRIX_WEBHOOK_URL.rstrip("/").split("/")[-1]), ("disk", DISK_TOKEN)]:
-            print(f"Trying fallback_url with {label} Bearer token")
-            result = try_download(fallback_url, {"Authorization": f"Bearer {token}"})
+            result = try_download(fallback_url,
+                                  {"Authorization": f"Bearer {token}"},
+                                  trace=trace, label=f"payload-url/{label}-bearer")
             if result:
                 return result
 
+    # 5. Крайняя мера — публичная ссылка (создаёт точку доступа, см. выше).
+    if os.getenv("DISK_EXTERNAL_LINK_FALLBACK", "1").strip() != "0":
+        for endpoint, label, token in [
+            (user_endpoint, "user-extlink", user_token),
+            (BITRIX_DISK_WEBHOOK_URL, "disk-extlink", None),
+            (BITRIX_WEBHOOK_URL, "main-extlink", None),
+        ]:
+            if not endpoint:
+                continue
+            result = fetch_via_external_link(endpoint, file_id, trace, label,
+                                             access_token=token or None)
+            if result:
+                return result
+    else:
+        trace.add("extlink", verdict="отключено DISK_EXTERNAL_LINK_FALLBACK=0")
+
     raise ValueError(
-        "Не удалось скачать файл из Битрикса — сервер не отдаёт тело файла "
-        "(у бота нет доступа к нему на Диске). Чаще всего это происходит с "
-        "ПЕРЕСЛАННЫМИ файлами: пришлите выписку обычным вложением (📎) в этот "
-        "чат, а не через «переслать». Если и так не качается — нужно проверить "
-        "права disk-вебхука в Битриксе (см. логи Railway)."
+        f"Не удалось скачать файл из Битрикса ({trace.summary()}).\n\n"
+        f"Рабочий обходной путь: загрузите выписку на странице "
+        f"{APP_PUBLIC_URL}/upload — файл уйдёт в обработку напрямую из браузера, "
+        f"минуя Диск Битрикса.\n\n"
+        f"Чтобы починить причину, откройте {APP_PUBLIC_URL}/download-test?file_id={file_id} "
+        f"— там полная трасса попыток."
     )
+
+
+def get_pdf_bytes(file_id, fallback_url=None, auth=None, trace=None):
+    """Скачивает PDF из Битрикса и запоминает трассу попыток для /check.
+
+    Тонкая обёртка над `_download_pdf`: сам перебор способов там, здесь —
+    только фиксация результата, чтобы причина провала не оставалась
+    исключительно в логах Railway.
+    """
+    trace = trace or DownloadTrace()
+    try:
+        content = _download_pdf(file_id, fallback_url, auth, trace)
+    except Exception:
+        _record_download(file_id, False, trace)
+        raise
+    _record_download(file_id, True, trace)
+    return content
 
 
 # ─────────────────────────────────────────────
@@ -1963,6 +2221,20 @@ def bot_delivery_report():
     if diag["send_errors"] and diag["send_errors"] == diag["sends_total"]:
         problems.append("❌ Ни одна отправка в чат не прошла с момента старта сервера.")
 
+    last_dl = diag.get("last_download")
+    if last_dl and not last_dl.get("ok"):
+        problems.append(
+            f"❌ Последнее скачивание файла из Битрикса провалилось "
+            f"({last_dl['at']}, file_id={last_dl['file_id']}): {last_dl['reason']}. "
+            f"Обходной путь для пользователя — {APP_PUBLIC_URL}/upload; полная "
+            f"трасса — {APP_PUBLIC_URL}/download-test?file_id={last_dl['file_id']}"
+        )
+    if isinstance(last_dl, dict):
+        # В /check хватает хвоста трассы: целиком её отдаёт /download-test.
+        steps = last_dl.get("steps") or []
+        last_dl["steps_total"] = len(steps)
+        last_dl["steps"] = steps[-12:]
+
     return problems, {"bot": bot, "activity": diag}
 
 
@@ -1997,6 +2269,65 @@ def check_services_route():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e),
                         "version": deployed_version()}), 200, NO_CACHE_HEADERS
+
+
+@app.route("/download-test", methods=["GET"])
+def download_test_route():
+    """Диагностика скачивания файла из Битрикса — трасса всех попыток.
+
+    Симптом «не удалось скачать файл» — это пять разных причин (нет прав,
+    портал молчит, вернулась страница логина, истёк токен, файла нет),
+    и снаружи они неотличимы. Логи Railway пользователю недоступны, поэтому
+    трассу отдаём HTTP-эндпоинтом:
+
+        /download-test?file_id=12345        — по ID файла на Диске
+        /download-test?dialog_id=chat7552   — взять последний PDF из чата
+
+    Ничего не пишет в таблицу: только качает и показывает, что произошло.
+    """
+    file_id = (request.args.get("file_id") or "").strip()
+    dialog_id = (request.args.get("dialog_id") or "").strip()
+    fallback_url = None
+    filename = ""
+
+    if not file_id and dialog_id:
+        found = find_recent_pdf_in_chat(dialog_id, limit=10)
+        if not found:
+            return jsonify({
+                "ok": False,
+                "error": f"В последних сообщениях {dialog_id} не нашли PDF. "
+                         f"ID чата можно посмотреть на {APP_PUBLIC_URL}/chats",
+                "version": deployed_version(),
+            }), 200, NO_CACHE_HEADERS
+        file_id = found["file_id"]
+        filename = found.get("filename") or ""
+        fallback_url = found.get("url_download")
+
+    if not file_id:
+        return jsonify({
+            "ok": False,
+            "error": "Укажите ?file_id=… или ?dialog_id=chatNNNN",
+            "version": deployed_version(),
+        }), 200, NO_CACHE_HEADERS
+
+    trace = DownloadTrace()
+    payload = {"version": deployed_version(), "file_id": file_id,
+               "filename": filename}
+    try:
+        content = get_pdf_bytes(file_id, fallback_url=fallback_url, trace=trace)
+        payload["ok"] = True
+        payload["size"] = len(content)
+        payload["looks_like_pdf"] = content.startswith(b"%PDF")
+        payload["message"] = ("Файл скачался. Значит проблема не в доступе к "
+                              "Диску — смотрите остальные шаги обработки.")
+    except Exception as e:
+        payload["ok"] = False
+        payload["error"] = str(e)
+        payload["reasons"] = trace.reasons
+        payload["hint"] = (f"Пока не починено — выписки можно грузить через "
+                           f"{APP_PUBLIC_URL}/upload")
+    payload["steps"] = trace.steps
+    return jsonify(payload), 200, NO_CACHE_HEADERS
 
 
 @app.route("/health", methods=["GET"])
