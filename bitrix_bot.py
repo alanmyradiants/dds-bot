@@ -215,6 +215,10 @@ _DIAG = {
 }
 _DIAG_LOCK = threading.Lock()
 
+# Сколько минут после старта не считать «событий не было» проблемой: счётчики
+# в памяти процесса обнуляются каждым деплоем.
+EVENTS_GRACE_MINUTES = 15
+
 
 def _record_event(event, dialog_id, extra=None):
     with _DIAG_LOCK:
@@ -1585,11 +1589,12 @@ def _public_page_download_links(html_text, base_url):
 def fetch_via_external_link(endpoint, file_id, trace, label, access_token=None):
     """disk.file.getExternalLink — ПУБЛИЧНАЯ ссылка, качается вообще без auth.
 
-    Последний способ в очереди, и намеренно: метод не просто читает файл, а
-    СОЗДАЁТ на него публичную ссылку в портале. Для банковской выписки это
-    лишняя (пусть и неугадываемая) точка доступа, поэтому идём сюда, только
-    когда все авторизованные способы уже провалились и альтернатива — совсем
-    не обработать выписку. Отключается env DISK_EXTERNAL_LINK_FALLBACK=0.
+    ПО УМОЛЧАНИЮ ВЫКЛЮЧЕН (включается env DISK_EXTERNAL_LINK_FALLBACK=1).
+    Метод не просто читает файл, а СОЗДАЁТ на него публичную ссылку в портале —
+    она открывается вообще без входа в Битрикс. Для банковской выписки это
+    лишняя точка доступа, а альтернатива на случай отказа уже есть и работает:
+    человек грузит файл на странице /upload. Пока авторизованный путь жив,
+    платить постоянной публичной ссылкой на каждую выписку не за что.
 
     Сама ссылка ведёт на страницу просмотра, а не на файл, поэтому: пробуем
     `?action=download`, а если не вышло — открываем страницу и берём ссылку
@@ -1647,11 +1652,13 @@ def _download_pdf(file_id, fallback_url, auth, trace):
     короткоживущие). Порядок — от самого «правильного» к самому отчаянному:
 
       0. REST от имени пользователя, приславшего файл (у него точно есть права).
-      1. disk.attachedObject.get — доступ по факту участия в чате.
-      2. disk.file.get основным вебхуком.
-      3. disk.file.get disk-вебхуком (2 попытки).
+      1. disk.file.get основным вебхуком — рабочий путь на 2026-09-06.
+      2. disk.file.get disk-вебхуком (2 попытки).
+      3. disk.attachedObject.get — на этом портале отвечает ERROR_NOT_FOUND,
+         но стоит копейки и может выстрелить в другой конфигурации.
       4. Прямая ссылка из payload (auth в query, затем Bearer).
-      5. Публичная внешняя ссылка — крайняя мера, см. fetch_via_external_link.
+      5. Публичная внешняя ссылка — по умолчанию ВЫКЛЮЧЕНА,
+         см. fetch_via_external_link.
 
     Всё уложено в DOWNLOAD_BUDGET_SEC; трасса попыток пишется в `trace`.
     """
@@ -1677,19 +1684,9 @@ def _download_pdf(file_id, fallback_url, auth, trace):
     else:
         trace.add("user", verdict="в событии нет access_token — пропускаем")
 
-    # 1. Attached object: спасает случай «сотрудник прислал файл из личного
-    #    Диска» — прав на файл нет, а на вложение в чате есть.
-    for endpoint, label, token in [
-        (BITRIX_WEBHOOK_URL, "main-attached", user_token or None),
-        (BITRIX_DISK_WEBHOOK_URL, "disk-attached", None),
-    ]:
-        result = fetch_via_attached_object(endpoint, file_id, trace, label,
-                                           access_token=token)
-        if result:
-            return result
-
-    # 2-3. Вебхуки портала. Больше двух попыток на disk-вебхук смысла не имеет:
-    #      если портал «немой», он немой на всех попытках.
+    # 1-2. Вебхуки портала — рабочий путь (трасса 2026-09-06: основной вебхук
+    #      отдаёт файл за 3,5 с). Больше двух попыток на disk-вебхук смысла не
+    #      имеет: если портал «немой», он немой на всех попытках.
     result = fetch_via_disk_file_get(BITRIX_WEBHOOK_URL, file_id, trace, "main")
     if result:
         return result
@@ -1702,6 +1699,22 @@ def _download_pdf(file_id, fallback_url, auth, trace):
             return result
         if attempt == 0:
             time.sleep(2)
+
+    # 3. Attached object — задумывался для случая «сотрудник прислал файл из
+    #    личного Диска»: прав на файл нет, а на вложение в чате есть. По трассе
+    #    2026-09-06 портал на file_id отвечает `400 ERROR_NOT_FOUND` (attach-id
+    #    это ДРУГОЙ идентификатор), поэтому способ стоит после вебхуков, а не
+    #    перед ними — иначе он даром съедал 1,2 с на каждой выписке.
+    for endpoint, label, token in [
+        (BITRIX_WEBHOOK_URL, "main-attached", user_token or None),
+        (BITRIX_DISK_WEBHOOK_URL, "disk-attached", None),
+    ]:
+        if trace.out_of_time():
+            break
+        result = fetch_via_attached_object(endpoint, file_id, trace, label,
+                                           access_token=token)
+        if result:
+            return result
 
     # 4. Прямая ссылка из payload. Сначала auth в query (работает для /rest/),
     #    затем Bearer (иногда проходит для /bitrix/).
@@ -1722,7 +1735,7 @@ def _download_pdf(file_id, fallback_url, auth, trace):
                 return result
 
     # 5. Крайняя мера — публичная ссылка (создаёт точку доступа, см. выше).
-    if os.getenv("DISK_EXTERNAL_LINK_FALLBACK", "1").strip() != "0":
+    if os.getenv("DISK_EXTERNAL_LINK_FALLBACK", "0").strip() == "1":
         for endpoint, label, token in [
             (user_endpoint, "user-extlink", user_token),
             (BITRIX_DISK_WEBHOOK_URL, "disk-extlink", None),
@@ -1735,7 +1748,8 @@ def _download_pdf(file_id, fallback_url, auth, trace):
             if result:
                 return result
     else:
-        trace.add("extlink", verdict="отключено DISK_EXTERNAL_LINK_FALLBACK=0")
+        trace.add("extlink",
+                  verdict="выключено по умолчанию (DISK_EXTERNAL_LINK_FALLBACK=1 включит)")
 
     raise ValueError(
         f"Не удалось скачать файл из Битрикса ({trace.summary()}).\n\n"
@@ -2305,11 +2319,21 @@ def bot_delivery_report():
                 f"→ прогнать /install-app"
             )
 
-    if diag["events_total"] == 0:
+    # Счётчики живут в памяти процесса, поэтому сразу после деплоя ноль событий —
+    # это норма, а не поломка. Раньше /check в первые же минуты после выкатки
+    # показывал красную проблему и уводил диагностику не туда.
+    uptime_min = 0
+    try:
+        uptime_min = (datetime.now() - datetime.fromisoformat(
+            diag["started_at"])).total_seconds() / 60
+    except Exception:
+        pass
+    if diag["events_total"] == 0 and uptime_min >= EVENTS_GRACE_MINUTES:
         problems.append(
             f"⚠️ Битрикс не присылал ни одного события с момента старта сервера "
-            f"({diag['started_at']}). Если в чат за это время писали — Битрикс НЕ "
-            f"доставляет события на /bot: проверить регистрацию бота (/install-app)."
+            f"({diag['started_at']}, {int(uptime_min)} мин назад). Если в чат за "
+            f"это время писали — Битрикс НЕ доставляет события на /bot: проверить "
+            f"регистрацию бота (/install-app)."
         )
     if diag.get("last_send") and not diag["last_send"].get("ok"):
         problems.append(
