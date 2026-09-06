@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import json
 import time
 import uuid
@@ -1239,8 +1240,15 @@ REST_TIMEOUT_SEC    = 15    # метаданные REST отвечают за д
 
 
 def _url_label(url):
-    """URL без query: в query лежит auth-токен, ему не место в логах и трассе."""
-    return str(url or "").split("?")[0]
+    """Адрес для логов и трассы, очищенный от всего, что даёт доступ.
+
+    Трассу пересылают в чатах и тикетах, поэтому режем два вида секретов:
+    query (там auth-токен) и хеш публичной ссылки `/doc/<hash>` — сам этот хеш
+    и есть пропуск к файлу, кто угодно откроет его без входа в портал.
+    Хватает первых символов, чтобы отличить один шаг от другого.
+    """
+    path = str(url or "").split("?")[0]
+    return re.sub(r"(/doc/)([^/]{6})[^/]+", r"\g<1>\g<2>…", path)
 
 
 def _with_auth_param(url, token):
@@ -1317,7 +1325,7 @@ def extract_download_url(file_info):
 
 
 def try_download(url, extra_headers=None, connect_timeout=10, read_timeout=30,
-                 trace=None, label="download"):
+                 trace=None, label="download", session=None):
     """Качает файл по ссылке. Возвращает bytes или None.
 
     stream=True + короткий read-timeout: тело читается кусками, поэтому «немой»
@@ -1342,8 +1350,9 @@ def try_download(url, extra_headers=None, connect_timeout=10, read_timeout=30,
         info = {"url": _url_label(url), "profile": profile_name}
 
         # Фаза 1: соединиться и получить заголовки.
+        getter = session.get if session is not None else requests.get
         try:
-            resp = requests.get(
+            resp = getter(
                 url, headers=headers, timeout=(connect_timeout, read_timeout),
                 allow_redirects=True, stream=True,
             )
@@ -1368,6 +1377,14 @@ def try_download(url, extra_headers=None, connect_timeout=10, read_timeout=30,
                 hops = [_url_label(r.url) for r in resp.history]
                 info["redirects"] = " → ".join(hops + [_url_label(resp.url)])
             if resp.status_code != 200:
+                # Битрикс кладёт настоящую причину в тело ответа
+                # ({"error":"expired_token"} и т.п.) — без неё «401» ничего
+                # не говорит о том, ЧТО именно не так с авторизацией.
+                try:
+                    info["body"] = safe_preview(resp.content[:400].decode(
+                        "utf-8", "replace"), 300)
+                except Exception:
+                    pass
                 info["verdict"] = "HTTP != 200"
                 trace.add(f"{label}/{profile_name}", **info)
                 trace.reason(f"портал ответил {resp.status_code}")
@@ -1478,12 +1495,31 @@ def _rest_get(endpoint, method, params, trace, label):
     return result
 
 
-def fetch_via_disk_file_get(endpoint, file_id, trace, label, access_token=None):
-    """disk.file.get → DOWNLOAD_URL → качаем.
+def _download_url_both_ways(dl, endpoint, access_token, trace, label):
+    """Качает DOWNLOAD_URL сначала КАК ЕСТЬ, потом с подставленным auth.
 
-    В DOWNLOAD_URL Битрикс кладёт auth сам, но не всегда (зависит от того, чем
-    авторизован вызов), поэтому если auth в ссылке нет — подставляем свой.
+    Порядок важен. Для входящего вебхука авторизация лежит В ПУТИ ссылки
+    (`/rest/1/<код>/download/`), а `auth` в query Битрикс пытается проверить как
+    OAuth-токен — и отвечает 401, хотя без него та же ссылка работает. То есть
+    «подставим auth на всякий случай» ломает рабочий запрос. Поэтому свой токен
+    подставляем только вторым заходом, когда ссылка как есть не сработала.
     """
+    had_auth = "auth=" in (urlparse(dl).query or "")
+    trace.add(f"{label}/url", url=_url_label(dl), had_auth=had_auth)
+
+    content = try_download(dl, trace=trace, label=f"{label}/body")
+    if content:
+        return content
+
+    token = access_token or endpoint.rstrip("/").split("/")[-1]
+    if had_auth or not token:
+        return None
+    return try_download(_with_auth_param(dl, token), trace=trace,
+                        label=f"{label}/body-auth")
+
+
+def fetch_via_disk_file_get(endpoint, file_id, trace, label, access_token=None):
+    """disk.file.get → DOWNLOAD_URL → качаем."""
     params = {"id": file_id}
     if access_token:
         params["auth"] = access_token
@@ -1495,8 +1531,7 @@ def fetch_via_disk_file_get(endpoint, file_id, trace, label, access_token=None):
         trace.add(f"{label}/disk.file.get", verdict="в ответе нет DOWNLOAD_URL")
         trace.reason("в ответе Битрикса нет ссылки на скачивание")
         return None
-    token = access_token or endpoint.rstrip("/").split("/")[-1]
-    return try_download(_with_auth_param(dl, token), trace=trace, label=f"{label}/body")
+    return _download_url_both_ways(dl, endpoint, access_token, trace, label)
 
 
 def fetch_via_attached_object(endpoint, file_id, trace, label, access_token=None):
@@ -1517,8 +1552,34 @@ def fetch_via_attached_object(endpoint, file_id, trace, label, access_token=None
     if not dl:
         trace.add(f"{label}/disk.attachedObject.get", verdict="нет DOWNLOAD_URL")
         return None
-    token = access_token or endpoint.rstrip("/").split("/")[-1]
-    return try_download(_with_auth_param(dl, token), trace=trace, label=f"{label}/body")
+    return _download_url_both_ways(dl, endpoint, access_token, trace, label)
+
+
+def _public_page_download_links(html_text, base_url):
+    """Вытаскивает из страницы публичного просмотра ссылки на скачивание.
+
+    `disk.file.getExternalLink` отдаёт адрес вида `/doc/<hash>` — это СТРАНИЦА
+    просмотра, а не файл (в трассе это видно как «пришла HTML-страница, 71 КБ»).
+    Кнопка «Скачать» на ней ведёт на отдельный адрес, который здесь и ищем.
+    """
+    found = re.findall(r'href=["\']([^"\']+)["\']', html_text, re.I)
+    found += re.findall(r'["\']((?:https?:)?\\?/[^"\'\s<>]*?download[^"\'\s<>]*)["\']',
+                        html_text, re.I)
+    links, seen = [], set()
+    for raw in found:
+        if "download" not in raw.lower():
+            continue
+        url = raw.replace("\\/", "/").replace("&amp;", "&").strip()
+        if url.startswith("//"):
+            url = "https:" + url
+        elif url.startswith("/"):
+            url = base_url + url
+        elif not url.lower().startswith("http"):
+            continue
+        if url not in seen:
+            seen.add(url)
+            links.append(url)
+    return links[:5]
 
 
 def fetch_via_external_link(endpoint, file_id, trace, label, access_token=None):
@@ -1529,6 +1590,11 @@ def fetch_via_external_link(endpoint, file_id, trace, label, access_token=None):
     лишняя (пусть и неугадываемая) точка доступа, поэтому идём сюда, только
     когда все авторизованные способы уже провалились и альтернатива — совсем
     не обработать выписку. Отключается env DISK_EXTERNAL_LINK_FALLBACK=0.
+
+    Сама ссылка ведёт на страницу просмотра, а не на файл, поэтому: пробуем
+    `?action=download`, а если не вышло — открываем страницу и берём ссылку
+    скачивания из неё. Всё в одной сессии: страница ставит cookie, которым
+    портал авторизует скачивание.
     """
     params = {"id": file_id}
     if access_token:
@@ -1538,7 +1604,40 @@ def fetch_via_external_link(endpoint, file_id, trace, label, access_token=None):
         return None
     if link.startswith("/"):
         link = bitrix_portal_url() + link
-    return try_download(link, trace=trace, label=f"{label}/body")
+
+    session = requests.Session()
+    sep = "&" if urlparse(link).query else "?"
+    content = try_download(f"{link}{sep}action=download", trace=trace,
+                           label=f"{label}/action-download", session=session)
+    if content:
+        return content
+
+    # Читаем саму страницу и ищем на ней кнопку «Скачать».
+    if trace.out_of_time():
+        return None
+    try:
+        page = session.get(link, timeout=(10, 20),
+                           headers={"User-Agent": "Mozilla/5.0"})
+    except Exception as e:
+        trace.add(f"{label}/page", error=f"{type(e).__name__}: {e}")
+        return None
+    if page.status_code != 200:
+        trace.add(f"{label}/page", status=page.status_code)
+        return None
+
+    candidates = _public_page_download_links(page.text, bitrix_portal_url())
+    trace.add(f"{label}/page", status=200, size=len(page.content),
+              found_links=len(candidates))
+    if not candidates:
+        trace.reason("на публичной странице нет ссылки на скачивание")
+    for i, cand in enumerate(candidates):
+        if trace.out_of_time():
+            break
+        content = try_download(cand, trace=trace,
+                               label=f"{label}/page-link-{i + 1}", session=session)
+        if content:
+            return content
+    return None
 
 
 def _download_pdf(file_id, fallback_url, auth, trace):
