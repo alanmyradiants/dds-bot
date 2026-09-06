@@ -469,7 +469,15 @@ def is_help_query(text):
 # ─────────────────────────────────────────────
 
 def check_all_services():
-    """Проверяет все сервисы и возвращает список проблем."""
+    """Проверяет сервисы и возвращает список ПРОБЛЕМ, БЛОКИРУЮЩИХ обработку.
+
+    Важное различие, которого раньше не было: временный сбой на стороне
+    провайдера (5xx, 429, обрыв связи) — НЕ повод отменять обработку выписки.
+    Это предполётная проверка, а не сама работа: реальные вызовы дальше сами
+    повторяются при 5xx (`num_retries` у Google), и один моргнувший 503 не
+    должен стоить пользователю целой выписки. Блокируем только то, что само не
+    рассосётся: нет ключа, нет доступа, нет таблицы.
+    """
     problems = []
 
     # 1. Проверка Anthropic API
@@ -488,16 +496,27 @@ def check_all_services():
     except anthropic.PermissionDeniedError:
         problems.append("❌ Anthropic API: доступ запрещён, проверьте оплату")
     except Exception as e:
-        problems.append(f"❌ Anthropic API: ошибка — {str(e)[:100]}")
+        # Перегрузка/таймаут Anthropic — временное; настоящий вызов ниже
+        # попробует сам. Блокировать выписку из-за этого нельзя.
+        if _is_transient_error(e) or isinstance(
+                e, (anthropic.APIConnectionError, anthropic.APITimeoutError)):
+            print(f"⚠️ Anthropic API: временный сбой, не блокируем — {str(e)[:120]}")
+        else:
+            problems.append(f"❌ Anthropic API: ошибка — {str(e)[:100]}")
 
     # 2. Проверка Google Sheets
     try:
         svc = get_sheets_service()
-        svc.spreadsheets().get(spreadsheetId=SHEET_ID).execute()
+        svc.spreadsheets().get(spreadsheetId=SHEET_ID).execute(num_retries=GOOGLE_API_RETRIES)
         print("✅ Google Sheets: OK")
     except Exception as e:
         err = str(e).lower()
-        if "403" in err or "permission" in err:
+        if _is_transient_error(e):
+            # 503/429 у Sheets случаются регулярно и проходят сами. Клиент уже
+            # повторил запрос GOOGLE_API_RETRIES раз — значит всплеск затяжной,
+            # но это всё равно не «проверьте настройки».
+            print(f"⚠️ Google Sheets: временный сбой, не блокируем — {str(e)[:120]}")
+        elif "403" in err or "permission" in err:
             problems.append("❌ Google Sheets: нет доступа или ключ недействителен")
         elif "404" in err:
             problems.append("❌ Google Sheets: таблица не найдена")
@@ -521,7 +540,7 @@ def check_all_services():
         else:
             problems.append(f"❌ Bitrix24: статус {resp.status_code}")
     except Exception as e:
-        problems.append(f"❌ Bitrix24: ошибка соединения — {str(e)[:100]}")
+        print(f"⚠️ Bitrix24: временный сбой связи, не блокируем — {str(e)[:120]}")
 
     return problems
 
@@ -656,6 +675,39 @@ def apply_rules(counterparty, description, amount, t_type):
 # Google Sheets
 # ─────────────────────────────────────────────
 
+# Сколько раз клиент Google повторит запрос при 429/5xx (с нарастающей паузой).
+# Sheets регулярно отдаёт короткие 503 «backend error» — без повтора один такой
+# всплеск отменял обработку целой выписки.
+GOOGLE_API_RETRIES = 5
+
+
+def _is_transient_error(exc):
+    """Временный сбой провайдера (5xx/429) или настоящая проблема доступа?
+
+    Разница принципиальная: 403/404 — это «чините настройки», а 503 — «Google
+    моргнул, повторите». Раньше и то и другое приводило к одному сообщению
+    «проверьте оплату и настройки» и отмене обработки выписки.
+    """
+    # У googleapiclient код лежит в exc.resp.status, у Anthropic — в
+    # exc.status_code. Это единственные надёжные источники.
+    status = getattr(getattr(exc, "resp", None), "status", None)
+    if status is None:
+        status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status == 429 or 500 <= status <= 599
+
+    # Фолбэк по тексту — только у явного маркера кода. Искать «503» просто
+    # подстрокой нельзя: три цифры подряд легко попадаются в ID таблицы и в URL,
+    # и тогда настоящая ошибка доступа сойдёт за временную.
+    match = re.search(r"(?:HttpError|Error code:?|status(?:[ _]code)?:?)\s*(\d{3})",
+                      str(exc), re.I)
+    if match:
+        code = int(match.group(1))
+        return code == 429 or 500 <= code <= 599
+    return isinstance(exc, (requests.exceptions.ConnectionError,
+                            requests.exceptions.Timeout))
+
+
 def get_sheets_service():
     if GOOGLE_CREDS_JSON is None:
         raise RuntimeError(GOOGLE_CREDS_ERROR or "нет кредов Google")
@@ -671,7 +723,7 @@ def init_sheets():
     service = get_sheets_service()
 
     # Получаем список существующих листов
-    spreadsheet = service.spreadsheets().get(spreadsheetId=SHEET_ID).execute()
+    spreadsheet = service.spreadsheets().get(spreadsheetId=SHEET_ID).execute(num_retries=GOOGLE_API_RETRIES)
     existing_sheets = [s["properties"]["title"] for s in spreadsheet["sheets"]]
 
     requests_body = []
@@ -687,7 +739,7 @@ def init_sheets():
         service.spreadsheets().batchUpdate(
             spreadsheetId=SHEET_ID,
             body={"requests": requests_body}
-        ).execute()
+        ).execute(num_retries=GOOGLE_API_RETRIES)
 
     # Заголовки Транзакции — вставляем принудительно в строку 1
     headers = [["Дата загрузки", "Кто загрузил", "Владелец счета", "Дата операции", "Время", "Код авторизации", "Месяц", "Контрагент",
@@ -700,7 +752,7 @@ def init_sheets():
         range="Транзакции!A1",
         valueInputOption="RAW",
         body={"values": headers}
-    ).execute()
+    ).execute(num_retries=GOOGLE_API_RETRIES)
     print("Заголовки обновлены")
 
     # Заголовок Правила — принудительно перезаписываем только заголовок
@@ -709,7 +761,7 @@ def init_sheets():
         range="Правила!A1:C1",
         valueInputOption="RAW",
         body={"values": [["Контрагент", "Категория", "Личное/Бизнес"]]}
-    ).execute()
+    ).execute(num_retries=GOOGLE_API_RETRIES)
     # Заголовок Заявки — журнал заявок на оплату
     service.spreadsheets().values().update(
         spreadsheetId=SHEET_ID,
@@ -722,7 +774,7 @@ def init_sheets():
             # Технические поля для отмены заявки из чата (можно скрыть колонки).
             "ID заявки", "ID заявителя", "ID сообщения",
         ]]},
-    ).execute()
+    ).execute(num_retries=GOOGLE_API_RETRIES)
 
     # Лист «Категории заявок» — источник списка категорий для формы.
     # Заголовок ставим всегда. Стандартные категории из PAYMENT_CATEGORIES_DEFAULT
@@ -735,10 +787,10 @@ def init_sheets():
         range="Категории заявок!A1",
         valueInputOption="RAW",
         body={"values": [["Категория"]]},
-    ).execute()
+    ).execute(num_retries=GOOGLE_API_RETRIES)
     existing = service.spreadsheets().values().get(
         spreadsheetId=SHEET_ID, range="Категории заявок!A2:A"
-    ).execute().get("values", [])
+    ).execute(num_retries=GOOGLE_API_RETRIES).get("values", [])
     existing_cats = [r[0].strip() for r in existing if r and r[0].strip()]
 
     # Итоговый порядок: сначала стандартные — в порядке PAYMENT_CATEGORIES_DEFAULT,
@@ -757,14 +809,14 @@ def init_sheets():
         # Порядок и состав изменились — переписываем столбец целиком.
         service.spreadsheets().values().clear(
             spreadsheetId=SHEET_ID, range="Категории заявок!A2:A",
-        ).execute()
+        ).execute(num_retries=GOOGLE_API_RETRIES)
         if final_cats:
             service.spreadsheets().values().update(
                 spreadsheetId=SHEET_ID,
                 range="Категории заявок!A2",
                 valueInputOption="RAW",
                 body={"values": [[c] for c in final_cats]},
-            ).execute()
+            ).execute(num_retries=GOOGLE_API_RETRIES)
         if added:
             print(f"ℹ️ Дописаны недостающие категории: {', '.join(added)}")
         if removed:
@@ -789,7 +841,7 @@ def get_existing_rules(service):
     try:
         result = service.spreadsheets().values().get(
             spreadsheetId=SHEET_ID, range="Правила!A:C"
-        ).execute()
+        ).execute(num_retries=GOOGLE_API_RETRIES)
         rows = result.get("values", [])
         # Словарь: контрагент (upper) -> (категория, тип)
         rules = {}
@@ -817,7 +869,7 @@ def save_new_rules(service, new_rules):
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
             body={"values": rows},
-        ).execute()
+        ).execute(num_retries=GOOGLE_API_RETRIES)
         print(f"✅ Добавлено новых правил: {len(rows)}")
     except Exception as e:
         print(f"save_new_rules error: {e}")
@@ -866,7 +918,7 @@ def get_existing_dedup_sets(service):
     try:
         header_resp = service.spreadsheets().values().get(
             spreadsheetId=SHEET_ID, range="Транзакции!1:1"
-        ).execute()
+        ).execute(num_retries=GOOGLE_API_RETRIES)
         headers = (header_resp.get("values") or [[]])[0]
 
         def idx_of(name):
@@ -887,7 +939,7 @@ def get_existing_dedup_sets(service):
 
         result = service.spreadsheets().values().get(
             spreadsheetId=SHEET_ID, range="Транзакции!A:Z"
-        ).execute()
+        ).execute(num_retries=GOOGLE_API_RETRIES)
         rows = result.get("values", [])
 
         def cell(row, idx):
@@ -942,7 +994,7 @@ def write_to_sheets(transactions, uploader="", account_owner=""):
     try:
         existing = service.spreadsheets().values().get(
             spreadsheetId=SHEET_ID, range="Транзакции!A:A"
-        ).execute()
+        ).execute(num_retries=GOOGLE_API_RETRIES)
         current_row = len(existing.get("values", [])) + 1
     except Exception:
         current_row = 2
@@ -1038,7 +1090,7 @@ def write_to_sheets(transactions, uploader="", account_owner=""):
         valueInputOption="USER_ENTERED",
         insertDataOption="INSERT_ROWS",
         body={"values": rows},
-    ).execute()
+    ).execute(num_retries=GOOGLE_API_RETRIES)
 
     # Сохраняем новые правила
     save_new_rules(service, new_rules)
@@ -1978,7 +2030,19 @@ def process_pdf_async(dialog_id, file_id, fallback_url, uploader="", auth=None,
 
     except Exception as e:
         print(f"process_pdf_async ERROR: {e}")
-        send_message(dialog_id, f"❌ Ошибка: {str(e)}")
+        if _is_transient_error(e):
+            # Сырой <HttpError 503 when requesting https://sheets.googleapis…>
+            # выглядит как поломка бота и провоцирует лезть в настройки, хотя
+            # чинить нечего: у провайдера всплеск, надо просто повторить.
+            send_message(
+                dialog_id,
+                "⏳ Google Sheets сейчас не отвечает (временный сбой на их "
+                "стороне, не в настройках). Пришлите выписку ещё раз через "
+                "пару минут — обычно проходит.\n\n"
+                f"Техническая деталь: {str(e)[:200]}",
+            )
+        else:
+            send_message(dialog_id, f"❌ Ошибка: {str(e)}")
 
 
 # ─────────────────────────────────────────────
@@ -2748,7 +2812,7 @@ def get_payment_categories():
         service = get_sheets_service()
         rows = service.spreadsheets().values().get(
             spreadsheetId=SHEET_ID, range="Категории заявок!A2:A"
-        ).execute().get("values", [])
+        ).execute(num_retries=GOOGLE_API_RETRIES).get("values", [])
         cats = [r[0].strip() for r in rows if r and r[0].strip()]
         if cats:
             return cats
@@ -2763,13 +2827,13 @@ def reset_payment_categories():
         service = get_sheets_service()
         service.spreadsheets().values().clear(
             spreadsheetId=SHEET_ID, range="Категории заявок!A2:A",
-        ).execute()
+        ).execute(num_retries=GOOGLE_API_RETRIES)
         service.spreadsheets().values().update(
             spreadsheetId=SHEET_ID,
             range="Категории заявок!A2",
             valueInputOption="RAW",
             body={"values": [[c] for c in PAYMENT_CATEGORIES_DEFAULT]},
-        ).execute()
+        ).execute(num_retries=GOOGLE_API_RETRIES)
     except Exception as e:
         print(f"reset_payment_categories error: {e}")
 
@@ -2788,7 +2852,7 @@ def add_payment_category(name):
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
             body={"values": [[name]]},
-        ).execute()
+        ).execute(num_retries=GOOGLE_API_RETRIES)
     except Exception as e:
         print(f"add_payment_category error: {e}")
 
@@ -2804,14 +2868,14 @@ def delete_payment_category(name):
         # Чистим всё под заголовком и пишем заново
         service.spreadsheets().values().clear(
             spreadsheetId=SHEET_ID, range="Категории заявок!A2:A",
-        ).execute()
+        ).execute(num_retries=GOOGLE_API_RETRIES)
         if remaining:
             service.spreadsheets().values().update(
                 spreadsheetId=SHEET_ID,
                 range="Категории заявок!A2",
                 valueInputOption="RAW",
                 body={"values": [[c] for c in remaining]},
-            ).execute()
+            ).execute(num_retries=GOOGLE_API_RETRIES)
     except Exception as e:
         print(f"delete_payment_category error: {e}")
 
@@ -2928,7 +2992,7 @@ def append_payment_request_row(row):
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body={"values": [row]},
-        ).execute()
+        ).execute(num_retries=GOOGLE_API_RETRIES)
     except Exception as e:
         print(f"append_payment_request_row error: {e}")
 
@@ -2947,7 +3011,7 @@ def find_payment_row_by_rid(rid):
         service = get_sheets_service()
         rows = service.spreadsheets().values().get(
             spreadsheetId=SHEET_ID, range="Заявки!A2:O"
-        ).execute().get("values", [])
+        ).execute(num_retries=GOOGLE_API_RETRIES).get("values", [])
         for i, r in enumerate(rows):
             if len(r) > 12 and (r[12] or "").strip() == rid:
                 return i + 2, r  # +2: строки начинаются с 1, данные — со 2-й
@@ -2965,7 +3029,7 @@ def set_payment_status(row_number, status):
             range=f"Заявки!L{row_number}",
             valueInputOption="RAW",
             body={"values": [[status]]},
-        ).execute()
+        ).execute(num_retries=GOOGLE_API_RETRIES)
     except Exception as e:
         print(f"set_payment_status error: {e}")
 
