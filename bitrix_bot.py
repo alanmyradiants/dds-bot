@@ -6,6 +6,7 @@ import time
 import uuid
 import base64
 import threading
+from html import escape as esc
 import requests
 from datetime import datetime
 from urllib.parse import parse_qs, urlparse
@@ -153,6 +154,11 @@ PAYMENT_CATEGORIES_DEFAULT = [
     "Изготовление бирок",
     "Коробки",
 ]
+
+# Значение в <select>, которым форма просит завести новую категорию.
+# Пришло такое — название берём из поля new_category, а не из списка.
+NEW_CATEGORY_VALUE = "__new__"
+PAYMENT_CATEGORY_MAX_LEN = 60
 
 # Категории, выведенные из оборота. `init_sheets` удаляет их из листа
 # «Категории заявок» — иначе старое название висело бы в форме вечно, ведь
@@ -2838,13 +2844,30 @@ def reset_payment_categories():
         print(f"reset_payment_categories error: {e}")
 
 
+def normalize_payment_category(name):
+    """Приводит введённое руками название к виду, пригодному для списка."""
+    return " ".join((name or "").split())[:PAYMENT_CATEGORY_MAX_LEN].strip()
+
+
 def add_payment_category(name):
-    name = (name or "").strip()
+    """Добавляет категорию в лист «Категории заявок».
+
+    Возвращает (название, добавлена_ли). Название — КАНОНИЧНОЕ: если такая
+    категория уже есть с другим регистром, возвращается существующее
+    написание. Иначе в списке заведутся близнецы «Зарплата» и «зарплата»,
+    а в отчёте ДДС они разойдутся на две строки вместо одной.
+
+    Пустое имя → (None, False) — зовущий решает, что сказать человеку.
+    Сбой Sheets → (название, False): заявку из-за этого не теряем, просто
+    категория не попала в список (в логах — причина).
+    """
+    name = normalize_payment_category(name)
     if not name:
-        return
+        return None, False
     try:
-        if name in get_payment_categories():
-            return
+        for existing in get_payment_categories():
+            if existing.lower() == name.lower():
+                return existing, False
         service = get_sheets_service()
         service.spreadsheets().values().append(
             spreadsheetId=SHEET_ID,
@@ -2853,8 +2876,10 @@ def add_payment_category(name):
             insertDataOption="INSERT_ROWS",
             body={"values": [[name]]},
         ).execute(num_retries=GOOGLE_API_RETRIES)
+        return name, True
     except Exception as e:
         print(f"add_payment_category error: {e}")
+        return name, False
 
 
 def delete_payment_category(name):
@@ -3037,7 +3062,12 @@ def set_payment_status(row_number, status):
 def _render_payment_form(users, categories, error=None):
     """HTML-форма создания заявки на оплату (открывается как Local App)."""
     cat_options = "\n".join(
-        f'<option value="{c}">{c}</option>' for c in categories
+        f'<option value="{esc(c, quote=True)}">{esc(c)}</option>' for c in categories
+    )
+    # Последним пунктом — «завести новую». Название уходит отдельным полем.
+    cat_options += (
+        f'\n<option value="{NEW_CATEGORY_VALUE}">'
+        f'＋ Новая категория…</option>'
     )
     user_options = "\n".join(
         f'<option value="{u["id"]}">{u["name"]}</option>' for u in users
@@ -3182,7 +3212,29 @@ def _render_payment_form(users, categories, error=None):
       </select>
 
       <label>Категория <span class="req">*</span></label>
-      <select name="category" required>{cat_options}</select>
+      <select name="category" id="categorySelect" required onchange="toggleNewCategory()">{cat_options}</select>
+      <div id="newCategoryBox" style="display:none; margin-top:8px;">
+        <input type="text" name="new_category" id="newCategoryInput"
+               maxlength="{PAYMENT_CATEGORY_MAX_LEN}"
+               placeholder="Название новой категории">
+        <div class="hint" style="margin-top:6px; font-size:12px;">
+          Появится в списке сразу и останется для следующих заявок.
+          Весь список — на <a href="/categories" target="_blank">странице категорий</a>.
+        </div>
+      </div>
+      <script>
+        function toggleNewCategory() {{
+          var sel = document.getElementById('categorySelect');
+          var box = document.getElementById('newCategoryBox');
+          var inp = document.getElementById('newCategoryInput');
+          var isNew = sel.value === '{NEW_CATEGORY_VALUE}';
+          box.style.display = isNew ? 'block' : 'none';
+          // required только когда поле видно: иначе браузер не даст отправить
+          // форму, ругаясь на скрытое поле.
+          inp.required = isNew;
+          if (isNew) {{ inp.focus(); }} else {{ inp.value = ''; }}
+        }}
+      </script>
 
       <label>Получатель <span class="req">*</span></label>
       <input type="text" name="recipient" placeholder="Кому платим: название / ФИО / ИП" required>
@@ -3313,6 +3365,16 @@ def payment_submit_route():
         requester_id = (form.get("requester_id") or "").strip()
         is_urgent    = urgency == "Срочный"
 
+        # Выбрана «＋ Новая категория…» — название лежит в new_category.
+        # Проверяем на сервере: в форму может прийти что угодно, а близнецы
+        # «Зарплата»/«зарплата» разведут отчёт на две строки.
+        category_added = False
+        if category == NEW_CATEGORY_VALUE:
+            category, category_added = add_payment_category(form.get("new_category"))
+            if not category:
+                return _render_payment_result(
+                    False, "Укажите название новой категории")
+
         if not (amount and category and recipient and purpose
                 and payer_id and requester_id):
             return _render_payment_result(False, "Заполнены не все обязательные поля")
@@ -3341,7 +3403,7 @@ def payment_submit_route():
                 header,
                 f"👤 Заявитель: {requester_name}",
                 f"💰 Сумма: {amount}",
-                f"📂 Категория: {category}",
+                f"📂 Категория: {category}" + (" — новая" if category_added else ""),
                 f"🚦 Срочность: {'🔴 СРОЧНЫЙ' if is_urgent else '🟢 Не срочный'}",
                 f"🏦 Получатель: {recipient}",
                 f"💳 Реквизиты: {requisites or '—'}",
@@ -3592,9 +3654,10 @@ def categories_route():
     for c in cats:
         rows += f"""
         <li>
-          <span>{c}</span>
-          <form method="POST" action="/categories/delete" onsubmit="return confirm('Удалить категорию «{c}»?');">
-            <input type="hidden" name="name" value="{c}">
+          <span>{esc(c)}</span>
+          <form method="POST" action="/categories/delete"
+                onsubmit="return confirm('Удалить категорию «' + this.querySelector('input[name=name]').value + '»?');">
+            <input type="hidden" name="name" value="{esc(c, quote=True)}">
             <button class="del" title="Удалить">✕</button>
           </form>
         </li>"""
